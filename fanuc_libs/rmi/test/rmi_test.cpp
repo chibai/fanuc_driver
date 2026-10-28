@@ -5,8 +5,8 @@
 
 #include <gtest/gtest.h>
 
-#include "rmi/rmi.hpp"
 #include "rmi/detail/line_buffer.hpp"
+#include "rmi/rmi.hpp"
 #include "rmi/serialization.hpp"
 
 TEST(ToJSON, ConnectPacket)
