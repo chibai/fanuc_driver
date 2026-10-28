@@ -1,12 +1,12 @@
-[submodule "fanuc_libs/dependencies/sockpp"]
-	path = fanuc_libs/dependencies/sockpp
+[submodule "third_party/sockpp"]
+	path = third_party/sockpp
 	url = https://github.com/fpagliughi/sockpp.git
-[submodule "fanuc_libs/dependencies/reflect-cpp"]
-	path = fanuc_libs/dependencies/reflect-cpp
+[submodule "third_party/reflect-cpp"]
+	path = third_party/reflect-cpp
 	url = https://github.com/getml/reflect-cpp.git
-[submodule "fanuc_libs/dependencies/readerwriterqueue"]
-	path = fanuc_libs/dependencies/readerwriterqueue
+[submodule "third_party/readerwriterqueue"]
+	path = third_party/readerwriterqueue
 	url = https://github.com/cameron314/readerwriterqueue.git
-[submodule "fanuc_libs/dependencies/yaml-cpp"]
-	path = fanuc_libs/dependencies/yaml-cpp
+[submodule "third_party/yaml-cpp"]
+	path = third_party/yaml-cpp
 	url = https://github.com/jbeder/yaml-cpp.git
