@@ -12,8 +12,6 @@ target_include_directories(rmi PUBLIC
     PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
-set_target_properties(rmi PROPERTIES CXX_STANDARD 20)
-
 if (BUILD_TESTING)
   add_subdirectory(test)
 endif ()

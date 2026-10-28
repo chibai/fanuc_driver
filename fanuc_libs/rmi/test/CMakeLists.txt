@@ -4,6 +4,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 add_executable(rmi_test rmi_test.cpp)
-set_target_properties(rmi_test PROPERTIES CXX_STANDARD 20)
+set_target_properties(rmi_test PROPERTIES CXX_STANDARD 23 CXX_STANDARD_REQUIRED ON)
 target_link_libraries(rmi_test PRIVATE rmi reflectcpp GTest::gtest_main)
 gtest_discover_tests(rmi_test)

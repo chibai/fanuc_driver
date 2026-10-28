@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "rmi/rmi.hpp"
+#include "rmi/detail/line_buffer.hpp"
 #include "rmi/serialization.hpp"
 
 #include <iconv.h>
@@ -11,6 +12,7 @@
 #include <iostream>
 #include <mutex>
 #include <sstream>
+#include <system_error>
 
 #include "rmi/packets.hpp"
 #include "sockpp/inet_address.h"
@@ -234,31 +236,31 @@ struct RMIConnection::PConnectionImpl
   std::vector<std::string> read()
   {
     char buf[2048];
-    mutex_.lock();
+    std::scoped_lock lock(mutex_);
     const sockpp::result<size_t> res = conn.read(buf, sizeof(buf));
-    mutex_.unlock();
-
-    std::vector<std::string> json_responses;
-    std::string_view buf_view(buf, res.value());
-    size_t pos = 0;
-    while (pos < buf_view.size())
+    if (res.is_error())
     {
-      const size_t end_pos = buf_view.find(kEndChars, pos);
-      if (end_pos == std::string_view::npos)
+      const auto error = res.error().default_error_condition();
+      if (error == std::errc::resource_unavailable_try_again || error == std::errc::operation_would_block)
       {
-        break;
+        return {};
       }
-      json_responses.emplace_back(buf_view.substr(pos, end_pos - pos));
-      pos = end_pos + strlen(kEndChars);
+      throw std::runtime_error("Failed to read from RMI TCP connection: " + res.error_message());
     }
 
-    return json_responses;
+    if (res.value() == 0)
+    {
+      throw std::runtime_error("RMI TCP connection was closed by the controller.");
+    }
+
+    return line_buffer_.append(std::string_view(buf, res.value()));
   }
 
   sockpp::tcp_connector conn;
 
 private:
   mutable std::mutex mutex_;
+  rmi::detail::LineBuffer line_buffer_;
 };
 
 RMIConnection::RMIConnection(const std::string& robot_ip_address, const uint16_t rmi_port)
@@ -348,10 +350,11 @@ std::optional<T> RMIConnection::checkPushPacket()
 {
   drainConnectionBuffer();
 
+  std::scoped_lock lock(mutex_);
   std::optional<T> packet;
   auto it = json_responses_.begin();
   auto possible_packet = checkForPacketInJSONResponses<T>(it, json_responses_);
-  while (packet.has_value())
+  while (possible_packet.has_value())
   {
     packet = possible_packet;
     possible_packet = checkForPacketInJSONResponses<T>(it, json_responses_);
