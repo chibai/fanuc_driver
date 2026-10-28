@@ -220,6 +220,11 @@ void FanucClient::readStateFromQueue()
 void FanucClient::writeJointTarget(const Eigen::VectorXd& joint_targets)
 {
   AssertIsStreaming(is_streaming_);
+  if (joint_targets.size() != last_joint_angles_.size())
+  {
+    throw std::invalid_argument("Joint targets size does not match the size of last joint angles.");
+  }
+
   readStateFromQueue();
   if (robot_status_.motion_possible && do_motn_ctrl_)
   {
@@ -230,10 +235,6 @@ void FanucClient::writeJointTarget(const Eigen::VectorXd& joint_targets)
     last_joint_angles_cmd_ = last_joint_angles_;
   }
 
-  if (joint_targets.size() != last_joint_angles_.size())
-  {
-    throw std::invalid_argument("Joint targets size does not match the size of last joint angles.");
-  }
   auto cur_time_from_start = std::chrono::high_resolution_clock::now() - start_time_;
   p_queue_impl_->command_queue_.enqueue({ cur_time_from_start, last_joint_angles_cmd_ });
 }
@@ -241,6 +242,11 @@ void FanucClient::writeJointTarget(const Eigen::VectorXd& joint_targets)
 void FanucClient::writeJointTargetRMI(const Eigen::VectorXd& joint_targets)
 {
   AssertNotStreaming(is_streaming_);
+  if (joint_targets.size() != last_joint_angles_.size())
+  {
+    throw std::invalid_argument("Joint targets size does not match the size of last joint angles.");
+  }
+
   last_joint_angles_cmd_ = joint_targets;
   last_joint_angles_cmd_[2] = last_joint_angles_cmd_[2] - last_joint_angles_cmd_[1];
 
