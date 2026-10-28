@@ -6,8 +6,6 @@
 cmake_minimum_required(VERSION 3.22)
 project(fanuc_libs VERSION 1.0.0 LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 17)
-
 find_package(ament_cmake QUIET)
 if (ament_cmake_FOUND)
     ament_package()
@@ -76,6 +74,12 @@ add_subdirectory(stream_motion)
 add_subdirectory(rmi)
 add_subdirectory(fanuc_client)
 add_subdirectory(gpio_config)
+
+# Keep the SDK targets independent of the ROS adapter's compiler standard.
+set_target_properties(stream_motion rmi fanuc_client gpio_config PROPERTIES
+    CXX_STANDARD 23
+    CXX_STANDARD_REQUIRED ON
+)
 
 if (BUILD_EXAMPLES)
   add_subdirectory(examples)

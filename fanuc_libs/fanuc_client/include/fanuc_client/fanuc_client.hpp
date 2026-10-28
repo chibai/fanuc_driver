@@ -5,7 +5,6 @@
 
 #pragma once
 
-#include <csignal>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -156,23 +155,11 @@ public:
   }
 
 private:
-  /** Setup signal handler for SIGINT */
-  void setupSignalHandler();
-
-  /** Restore previous signal handler */
-  void restoreSignalHandler();
-
-  /** Static signal handler function */
-  static void signalHandler(int signal);
-
-  /** Static pointer to current instance for signal handler */
+  /** Static pointer to the current client instance */
   static FanucClient* instance_;
 
-  /** Mutex to protect instance_ access from signal handler */
+  /** Mutex to protect instance_ access */
   static std::mutex instance_mutex_;
-
-  /** Previous signal handler to restore */
-  static struct sigaction previous_sigaction_;
 
 private:
   void readStateFromQueue();

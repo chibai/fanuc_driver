@@ -252,6 +252,9 @@ TEST(FanucClientTest, TestSuccessfulLifecycle)
   }
   ASSERT_TRUE(stream_connected);
 
+  EXPECT_THROW(fanuc_client.writeJointTarget(Eigen::VectorXd::Zero(stream_motion::kMaxAxisNumber - 1)),
+               std::invalid_argument);
+
   // After starting the stream, we the first read should return the initial joint angles
   Eigen::VectorXd joint_states = fanuc_client.readJointAngles();
   EXPECT_EQ(joint_states, initial_joint_targets);
@@ -273,6 +276,18 @@ TEST(FanucClientTest, TestSuccessfulLifecycle)
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   EXPECT_FALSE(stream_connected);
+}
+
+TEST(FanucClientTest, RejectsInvalidRMIJointTargetSize)
+{
+  std::atomic<bool> stream_connected = false;
+  auto stream_motion_interface = std::make_unique<NiceMockStreamMotionConnection>(stream_connected);
+  auto rmi_interface = std::make_unique<NiceMockRMIConnection>();
+  fanuc_client::FanucClient fanuc_client("127.0.0.1", 60015, 16001, std::move(stream_motion_interface),
+                                         std::move(rmi_interface), "UTF-8");
+
+  EXPECT_THROW(fanuc_client.writeJointTargetRMI(Eigen::VectorXd::Zero(stream_motion::kMaxAxisNumber - 1)),
+               std::invalid_argument);
 }
 
 TEST(FanucClientTest, TestGetLimits)

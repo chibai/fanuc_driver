@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 
+#include "rmi/detail/line_buffer.hpp"
 #include "rmi/rmi.hpp"
 #include "rmi/serialization.hpp"
 
@@ -33,4 +34,29 @@ TEST(FromJSON, ConnectPacketResponse)
   EXPECT_EQ(expected_connect_packet_response.MajorVersion, connect_packet_response.value().MajorVersion);
   EXPECT_EQ(expected_connect_packet_response.MinorVersion, connect_packet_response.value().MinorVersion);
   EXPECT_EQ(expected_connect_packet_response.PortNumber, connect_packet_response.value().PortNumber);
+}
+
+TEST(RmiLineBuffer, PreservesPartialFramesAcrossAppends)
+{
+  rmi::detail::LineBuffer buffer;
+
+  EXPECT_TRUE(buffer.append(R"({"first":1)").empty());
+  const auto lines = buffer.append("}\r\n");
+
+  ASSERT_EQ(lines.size(), 1);
+  EXPECT_EQ(lines.front(), R"({"first":1})");
+}
+
+TEST(RmiLineBuffer, ReturnsEveryCompleteFrameAndKeepsTrailingFragment)
+{
+  rmi::detail::LineBuffer buffer;
+
+  const auto first_lines = buffer.append("one\r\ntwo\r\npar");
+  ASSERT_EQ(first_lines.size(), 2);
+  EXPECT_EQ(first_lines[0], "one");
+  EXPECT_EQ(first_lines[1], "two");
+
+  const auto second_lines = buffer.append("tial\r\n");
+  ASSERT_EQ(second_lines.size(), 1);
+  EXPECT_EQ(second_lines.front(), "partial");
 }
