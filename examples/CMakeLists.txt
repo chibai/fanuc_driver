@@ -9,5 +9,8 @@ target_link_libraries(stream_motion_example PRIVATE stream_motion)
 add_executable(rmi_connection_example rmi_connection_example.cpp)
 target_link_libraries(rmi_connection_example PRIVATE rmi)
 
-add_executable(fanuc_client_example fanuc_client_example.cpp)
-target_link_libraries(fanuc_client_example PRIVATE fanuc_client)
+add_executable(fanuc_driver_example fanuc_driver_example.cpp)
+target_link_libraries(fanuc_driver_example PRIVATE fanuc_driver::fanuc_driver)
+
+add_executable(fanuc_client_example fanuc_driver_example.cpp)
+target_link_libraries(fanuc_client_example PRIVATE fanuc_driver::fanuc_driver)

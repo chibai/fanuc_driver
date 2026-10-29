@@ -5,6 +5,8 @@
 
 #include "fanuc_client/gpio_buffer.hpp"
 
+#include <cstring>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -134,6 +136,15 @@ int Align(int value, int alignment)
   return remainder == 0 ? value : value - remainder + alignment;
 }
 
+void ValidateBlock(uint32_t start, size_t size, size_t max_size)
+{
+  if (start == 0 || size == 0 || size > max_size || start > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
+      size - 1 > static_cast<uint32_t>(std::numeric_limits<int>::max()) - start)
+  {
+    throw std::invalid_argument("GPIO block requires a positive index and a non-empty range fitting the IO buffer.");
+  }
+}
+
 }  // namespace
 
 template <CommandGPIOTypes gpio_type, typename T>
@@ -209,7 +220,8 @@ void GPIOBuffer::CommandBlock<gpio_type, T>::set(int index, T value)
   else
   {
     // Keep bytes stored little endian.
-    *reinterpret_cast<T*>(ptr_ + buf_index) = swapBytesIfNeeded(value, !isLittleEndian());
+    const T encoded = swapBytesIfNeeded(value, !isLittleEndian());
+    std::memcpy(ptr_ + buf_index, &encoded, sizeof(encoded));
   }
 }
 
@@ -234,7 +246,9 @@ T GPIOBuffer::StatusBlock<gpio_type, T>::get(int index)
   else
   {
     // Bytes stored little endian.
-    return swapBytesIfNeeded(*reinterpret_cast<T*>(ptr_ + buf_index), !isLittleEndian());
+    T value;
+    std::memcpy(&value, ptr_ + buf_index, sizeof(value));
+    return swapBytesIfNeeded(value, !isLittleEndian());
   }
 };
 
@@ -268,6 +282,7 @@ template class GPIOBuffer::StatusBlock<StatusGPIOTypes::FloatReg, float>;
 template <CommandGPIOTypes gpio_type, typename T>
 GPIOBuffer::CommandBlock<gpio_type, T>& GPIOBuffer::Builder::addCommandConfig(uint32_t start_index, size_t size)
 {
+  ValidateBlock(start_index, size, std::is_same_v<T, bool> ? kBufferLength * 8 : kBufferLength / sizeof(T));
   if (blocks_.size() == kMaxConfigs)
   {
     ThrowNoMoreConfigs();
@@ -293,6 +308,7 @@ GPIOBuffer::CommandBlock<gpio_type, T>& GPIOBuffer::Builder::addCommandConfig(ui
 template <StatusGPIOTypes gpio_type, typename T>
 GPIOBuffer::StatusBlock<gpio_type, T>& GPIOBuffer::Builder::addStatusConfig(uint32_t start_index, size_t size)
 {
+  ValidateBlock(start_index, size, std::is_same_v<T, bool> ? kBufferLength * 8 : kBufferLength / sizeof(T));
   if (blocks_.size() == kMaxConfigs)
   {
     ThrowNoMoreConfigs();

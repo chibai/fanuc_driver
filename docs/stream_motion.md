@@ -2,6 +2,10 @@
 
 ## Overview
 
+For combined RMI, streaming and GPIO operations, prefer the
+[`fanuc_driver` class](../README.md#unified-interface). This guide covers the
+lower-level UDP interface.
+
 The `StreamMotionConnection` class in the `stream_motion` namespace provides
 an interface for communicating with a robot controller over a UDP socket.
 It implements the communication protocol described in tables 3.3 "Stream
@@ -21,9 +25,9 @@ The packet structures are defined in the header file:
 ### Add to your CMake project
 
 ```cmake
-find_package(stream_motion REQUIRED)
+find_package(fanuc_driver REQUIRED)
 # ...
-target_link_libraries(stream_motion_test PRIVATE stream_motion)
+target_link_libraries(stream_motion_test PRIVATE fanuc_driver::stream_motion)
 ```
 
 ### Include in your source code
@@ -33,7 +37,7 @@ target_link_libraries(stream_motion_test PRIVATE stream_motion)
 
 // ...
 // Instantiating the connection with the robot controller's IP address and port
-stream_motion::StreamMotionConnection connection(ip_address, port)
+stream_motion::StreamMotionConnection connection(ip_address, 1.0, port);
 ```
 
 The public interface for the `StreamMotionConnection` class can be found
