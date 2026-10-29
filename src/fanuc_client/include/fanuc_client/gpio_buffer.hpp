@@ -7,7 +7,10 @@
 
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <string_view>
+#include <type_traits>
+#include <utility>
 #include <vector>
 #include "stream_motion/packets.hpp"
 
@@ -41,6 +44,14 @@ public:
     F,
     FloatReg,
   };
+
+  template <CommandGPIOTypes Type>
+  using CommandValue = std::conditional_t<Type == CommandGPIOTypes::AO, uint16_t,
+                                          std::conditional_t<Type == CommandGPIOTypes::FloatReg, float, bool>>;
+
+  template <StatusGPIOTypes Type>
+  using StatusValue = std::conditional_t<Type == StatusGPIOTypes::AI || Type == StatusGPIOTypes::AO, uint16_t,
+                                         std::conditional_t<Type == StatusGPIOTypes::FloatReg, float, bool>>;
 
   // Represents a view into the command or status buffer.
   class BlockInterface
@@ -178,6 +189,18 @@ public:
    * use to configure commanding gpio. */
   stream_motion::GPIOConfiguration toStreamMotionConfig() const;
 
+  template <CommandGPIOTypes Type, typename T>
+  CommandBlock<Type, T>& commandBlock(int index)
+  {
+    return findBlock<CommandBlock<Type, T>>(index);
+  }
+
+  template <StatusGPIOTypes Type, typename T>
+  StatusBlock<Type, T>& statusBlock(int index)
+  {
+    return findBlock<StatusBlock<Type, T>>(index);
+  }
+
   const RawGPIOBuffer& command_buffer() const
   {
     return *command_buffer_;
@@ -189,6 +212,24 @@ public:
   }
 
 private:
+  template <typename Block>
+  Block& findBlock(int index)
+  {
+    if (index >= 0)
+    {
+      for (const auto& block : blocks_)
+      {
+        if (auto* typed_block = dynamic_cast<Block*>(block.get());
+            typed_block != nullptr && static_cast<uint32_t>(index) >= block->start_index() &&
+            static_cast<uint32_t>(index) - block->start_index() < block->size())
+        {
+          return *typed_block;
+        }
+      }
+    }
+    throw std::out_of_range("No GPIO block of the requested type contains index " + std::to_string(index));
+  }
+
   GPIOBuffer(std::unique_ptr<RawGPIOBuffer> command_buffer, std::unique_ptr<RawGPIOBuffer> status_buffer,
              std::vector<std::unique_ptr<BlockInterface>> blocks)
     : command_buffer_{ std::move(command_buffer) }

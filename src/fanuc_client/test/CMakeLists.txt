@@ -5,6 +5,7 @@
 
 add_executable(fanuc_client_test fanuc_client_test.cpp)
 target_link_libraries(fanuc_client_test PRIVATE fanuc_client GTest::gtest_main GTest::gmock_main)
+target_compile_definitions(fanuc_client_test PRIVATE FANUC_DRIVER_SOURCE_DIR="${PROJECT_SOURCE_DIR}/../..")
 gtest_discover_tests(fanuc_client_test)
 
 add_executable(gpio_buffer_test gpio_buffer_test.cpp)

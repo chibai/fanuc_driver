@@ -71,14 +71,19 @@ endif ()
 
 add_subdirectory(src/stream_motion)
 add_subdirectory(src/rmi)
-add_subdirectory(src/fanuc_client)
 add_subdirectory(src/gpio_config)
+add_subdirectory(src/fanuc_driver)
+add_subdirectory(src/fanuc_client)
 
 # All driver targets require C++23.
-set_target_properties(stream_motion rmi fanuc_client gpio_config PROPERTIES
+set_target_properties(stream_motion rmi fanuc_client gpio_config fanuc_driver PROPERTIES
     CXX_STANDARD 23
     CXX_STANDARD_REQUIRED ON
 )
+foreach(target stream_motion rmi fanuc_client gpio_config)
+  target_compile_features(${target} PUBLIC cxx_std_23)
+  set_target_properties(${target} PROPERTIES CXX_EXTENSIONS OFF)
+endforeach()
 
 if (BUILD_EXAMPLES)
   add_subdirectory(examples)
@@ -101,7 +106,7 @@ configure_package_config_file(cmake/fanuc_driverConfig.cmake.in
 
 # --- Install ---
 include(GNUInstallDirs)
-install(TARGETS stream_motion rmi fanuc_client gpio_config
+install(TARGETS stream_motion rmi fanuc_client gpio_config fanuc_driver
     EXPORT fanuc_driverExports
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -120,6 +125,7 @@ install(DIRECTORY
     src/stream_motion/include/
     src/fanuc_client/include/
     src/gpio_config/include/
+    src/fanuc_driver/include/
     DESTINATION
     ${CMAKE_INSTALL_INCLUDEDIR}
 )
