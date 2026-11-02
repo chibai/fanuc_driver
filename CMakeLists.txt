@@ -8,9 +8,11 @@ project(fanuc_driver VERSION 2.4.0 LANGUAGES CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 include(GNUInstallDirs)
+option(BUILD_TESTING "Build tests" OFF)
+option(BUILD_EXAMPLES "Build examples" OFF)
 
 
-# Build the sockpp library
+# Third-party dependencies
 include(FetchContent)
 FetchContent_Declare(
     sockpp
@@ -69,24 +71,79 @@ if (BUILD_TESTING)
   enable_testing()
 endif ()
 
-add_subdirectory(src/stream_motion)
-add_subdirectory(src/rmi)
-add_subdirectory(src/gpio_config)
-add_subdirectory(src/fanuc_driver)
-add_subdirectory(src/fanuc_client)
+find_package(Eigen3 REQUIRED)
+find_package(Threads REQUIRED)
 
-# All driver targets require C++23.
-set_target_properties(stream_motion rmi fanuc_client gpio_config fanuc_driver PROPERTIES
+add_library(fanuc_driver SHARED
+    src/rmi/src/rmi.cpp
+    src/rmi/src/serialization.cpp
+    src/rmi/src/deserialization.cpp
+    src/stream_motion/src/stream.cpp
+    src/stream_motion/src/byte_ops.cpp
+    src/gpio_config/src/gpio_config.cpp
+    src/fanuc_driver/src/fanuc_driver.cpp
+    src/fanuc_driver/src/gpio_config.cpp
+    src/fanuc_client/src/gpio_buffer.cpp
+    src/fanuc_client/src/rmi_singleton.cpp
+)
+add_library(fanuc_driver::fanuc_driver ALIAS fanuc_driver)
+target_compile_features(fanuc_driver PUBLIC cxx_std_23)
+set_target_properties(fanuc_driver PROPERTIES
     CXX_STANDARD 23
     CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF
 )
-foreach(target stream_motion rmi fanuc_client gpio_config)
-  target_compile_features(${target} PUBLIC cxx_std_23)
-  set_target_properties(${target} PROPERTIES CXX_EXTENSIONS OFF)
-endforeach()
+target_include_directories(fanuc_driver PUBLIC
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src/rmi/include>
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src/stream_motion/include>
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src/gpio_config/include>
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src/fanuc_client/include>
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src/fanuc_driver/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
+target_link_libraries(fanuc_driver
+    PUBLIC Eigen3::Eigen
+    PRIVATE reflectcpp Sockpp::sockpp readerwriterqueue Threads::Threads
+)
 
 if (BUILD_EXAMPLES)
-  add_subdirectory(examples)
+  add_executable(stream_motion_example examples/stream_motion_example.cpp)
+  target_link_libraries(stream_motion_example PRIVATE fanuc_driver::fanuc_driver)
+
+  add_executable(rmi_connection_example examples/rmi_connection_example.cpp)
+  target_link_libraries(rmi_connection_example PRIVATE fanuc_driver::fanuc_driver)
+
+  add_executable(fanuc_driver_example examples/fanuc_driver_example.cpp)
+  target_link_libraries(fanuc_driver_example PRIVATE fanuc_driver::fanuc_driver)
+
+  add_executable(fanuc_client_example examples/fanuc_driver_example.cpp)
+  target_link_libraries(fanuc_client_example PRIVATE fanuc_driver::fanuc_driver)
+endif ()
+
+if (BUILD_TESTING)
+  add_executable(rmi_test src/rmi/test/rmi_test.cpp)
+  target_link_libraries(rmi_test PRIVATE fanuc_driver::fanuc_driver GTest::gtest_main)
+  gtest_discover_tests(rmi_test)
+
+  add_executable(stream_motion_test src/stream_motion/test/stream_test.cpp)
+  target_link_libraries(stream_motion_test PRIVATE fanuc_driver::fanuc_driver GTest::gtest_main Sockpp::sockpp)
+  gtest_discover_tests(stream_motion_test)
+
+  add_executable(gpio_config_test src/gpio_config/test/gpio_config_test.cpp)
+  target_link_libraries(gpio_config_test PRIVATE fanuc_driver::fanuc_driver GTest::gtest_main GTest::gmock_main)
+  target_compile_definitions(gpio_config_test PRIVATE
+      YAML_TEST_FOLDER="${PROJECT_SOURCE_DIR}/src/gpio_config/test/data"
+  )
+  gtest_discover_tests(gpio_config_test)
+
+  add_executable(fanuc_client_test src/fanuc_client/test/fanuc_client_test.cpp)
+  target_link_libraries(fanuc_client_test PRIVATE fanuc_driver::fanuc_driver GTest::gtest_main GTest::gmock_main)
+  target_compile_definitions(fanuc_client_test PRIVATE FANUC_DRIVER_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+  gtest_discover_tests(fanuc_client_test)
+
+  add_executable(gpio_buffer_test src/fanuc_client/test/gpio_buffer_test.cpp)
+  target_link_libraries(gpio_buffer_test PRIVATE fanuc_driver::fanuc_driver GTest::gtest_main GTest::gmock_main)
+  gtest_discover_tests(gpio_buffer_test)
 endif ()
 
 # Create cmake config and version files
@@ -105,8 +162,7 @@ configure_package_config_file(cmake/fanuc_driverConfig.cmake.in
 )
 
 # --- Install ---
-include(GNUInstallDirs)
-install(TARGETS stream_motion rmi fanuc_client gpio_config fanuc_driver
+install(TARGETS fanuc_driver
     EXPORT fanuc_driverExports
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}

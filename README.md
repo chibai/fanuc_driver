@@ -8,11 +8,11 @@ A C++23 robot driver library for FANUC controllers.
 CMakeLists.txt     top-level build, install and package export
 cmake/             package config template
 src/
-  rmi/             Remote Motion Interface (JSON over TCP) client
-  stream_motion/   Stream Motion (UDP) client
-  fanuc_driver/    Unified fanuc_driver class owning connections and GPIO configuration
-  fanuc_client/    GPIO buffers and legacy compatibility entry points
-  gpio_config/     YAML GPIO configuration loader
+  rmi/             Remote Motion Interface implementation
+  stream_motion/   Stream Motion implementation
+  fanuc_driver/    Unified fanuc_driver class and GPIO configuration
+  fanuc_client/    GPIO buffer implementation and legacy compatibility entry points
+  gpio_config/     YAML GPIO configuration implementation
 examples/          Example programs
 third_party/       Vendored dependencies (git submodules) and patches
 docs/              Additional documentation
@@ -34,7 +34,10 @@ find_package(fanuc_driver REQUIRED)
 target_link_libraries(my_app PRIVATE fanuc_driver::fanuc_driver)
 ```
 
-The exported target propagates C++23 and Eigen3 requirements to consumers.
+The exported target is the single library entry point and propagates C++23 and
+Eigen3 requirements to consumers. RMI, Stream Motion, GPIO configuration and
+legacy compatibility code are built into this library; they do not have
+protocol-specific CMake targets.
 
 ```cpp
 #include <fanuc_driver/fanuc_driver.hpp>
@@ -114,13 +117,13 @@ ensure the controller is prepared before running it.
 ## Compatibility
 
 Existing source using `<fanuc_client/fanuc_client.hpp>` and
-`fanuc_client::FanucClient` continues to work through a type alias; the
-`fanuc_driver::fanuc_client` CMake target is retained. Rebuild consumers after
-upgrading; binary compatibility is not maintained.
+`fanuc_client::FanucClient` continues to work through a type alias. Rebuild
+consumers after upgrading; binary compatibility is not maintained.
 The global `FanucClient::get_instance()` entry point was removed: pass driver
 references explicitly. `RMISingleton` remains a legacy standalone utility, but
 constructing a driver no longer registers a connection with it.
-Lower-level RMI, Stream Motion and GPIO configuration targets remain available.
+Lower-level protocol headers remain available for advanced use, but link
+consumers to `fanuc_driver::fanuc_driver`.
 
 Requires Eigen3 and a C++23 compiler. See [docs/stream_motion.md](docs/stream_motion.md)
 for the low-level UDP interface.
