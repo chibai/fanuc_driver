@@ -3,10 +3,10 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include "rmi/serialization.hpp"
+#include "detail/serialization.hpp"
 
+#include "fanuc_driver/packets.hpp"
 #include "rfl/json.hpp"
-#include "rmi/packets.hpp"
 
 namespace rmi
 {
@@ -105,7 +105,6 @@ FromJSON<GetUFrameToolFramePacket::Response>(const std::string&);
 template std::optional<WriteUFrameDataPacket::Response> FromJSON<WriteUFrameDataPacket::Response>(const std::string&);
 template std::optional<SetUFrameToolFramePacket::Response>
 FromJSON<SetUFrameToolFramePacket::Response>(const std::string&);
-template std::optional<ConnectROS2Packet::Response> FromJSON<ConnectROS2Packet::Response>(const std::string&);
 template std::optional<SetPayloadInstructionPacket::Response>
 FromJSON<SetPayloadInstructionPacket::Response>(const std::string&);
 

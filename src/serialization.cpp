@@ -3,10 +3,10 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include "rmi/serialization.hpp"
+#include "detail/serialization.hpp"
 
+#include "fanuc_driver/packets.hpp"
 #include "rfl/json.hpp"
-#include "rmi/packets.hpp"
 
 namespace rmi
 {
@@ -70,7 +70,6 @@ template std::string ToJSON<CircularRelativePacket::Request>(const CircularRelat
 template std::string ToJSON<GetUFrameToolFramePacket::Request>(const GetUFrameToolFramePacket::Request&);
 template std::string ToJSON<JointRelativePacket::Request>(const JointRelativePacket::Request&);
 template std::string ToJSON<LinearRelativePacket::Request>(const LinearRelativePacket::Request&);
-template std::string ToJSON<ConnectROS2Packet::Request>(const ConnectROS2Packet::Request&);
 template std::string ToJSON<SetPayloadInstructionPacket::Request>(const SetPayloadInstructionPacket::Request&);
 
 }  // namespace rmi

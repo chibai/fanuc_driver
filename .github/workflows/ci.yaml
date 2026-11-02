@@ -21,7 +21,10 @@ jobs:
         with:
           submodules: recursive
       - run: git config --global --add safe.directory '*'
-      - run: sudo apt-get update && sudo apt-get install -y cmake g++ libeigen3-dev
+      - run: sudo apt-get update && sudo apt-get install -y cmake g++
       - run: cmake -B build -S . -DBUILD_TESTING=ON -DBUILD_EXAMPLES=ON
       - run: cmake --build build -j
       - run: ctest --test-dir build --output-on-failure
+      - run: cmake --install build --prefix "$RUNNER_TEMP/fanuc_driver"
+      - run: cmake -S tests/consumer -B build/consumer -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/fanuc_driver"
+      - run: cmake --build build/consumer -j2

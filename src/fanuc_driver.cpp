@@ -3,23 +3,24 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#include "rmi/rmi.hpp"
-#include "rmi/detail/line_buffer.hpp"
-#include "rmi/serialization.hpp"
+#include "fanuc_driver/fanuc_driver.hpp"
+#include "detail/line_buffer.hpp"
+#include "detail/serialization.hpp"
 
 #include <iconv.h>
+#include <algorithm>
 #include <array>
+#include <chrono>
 #include <iostream>
 #include <mutex>
 #include <sstream>
 #include <system_error>
 
-#include "rmi/packets.hpp"
+#include "fanuc_driver/packets.hpp"
 #include "sockpp/inet_address.h"
 #include "sockpp/tcp_connector.h"
 
-namespace rmi
-{
+using namespace rmi;
 
 namespace
 {
@@ -99,7 +100,7 @@ std::string LookupErrorCode(const uint32_t error_code)
 template <typename T>
 bool CheckSequenceIDIfPresent(T& packet, int expected_sequence_id)
 {
-  if constexpr (requires(typename T::Response t) { t.SequenceID; })
+  if constexpr (requires(T t) { t.SequenceID; })
   {
     return packet.SequenceID == expected_sequence_id;
   }
@@ -197,7 +198,7 @@ void addCallArguments(ProgramCallPacket::Request& packet, const std::vector<RMIC
 
 }  // namespace
 
-struct RMIConnection::PConnectionImpl
+struct Fanuc_driver::PConnectionImpl
 {
   PConnectionImpl(const std::string& robot_ip_address, const uint16_t robot_port)
   {
@@ -219,7 +220,11 @@ struct RMIConnection::PConnectionImpl
       return json_str;
     }();
     std::scoped_lock lock(mutex_);
-    conn.write(json_string);
+    const auto result = conn.write(json_string);
+    if (!result)
+      throw std::runtime_error("Failed to write to RMI TCP connection: " + result.error_message());
+    if (result.value() != json_string.size())
+      throw std::runtime_error("Incomplete write to RMI TCP connection.");
   }
 
   void createNewConnection(const std::string& robot_ip_address, const uint16_t robot_port)
@@ -230,7 +235,8 @@ struct RMIConnection::PConnectionImpl
     {
       throw std::runtime_error("Failed to create TCP connection at: " + robot_ip_address);
     }
-    conn.set_non_blocking(true);
+    if (const auto result = conn.set_non_blocking(true); !result)
+      throw std::runtime_error("Failed to set RMI TCP connection to non-blocking mode: " + result.error_message());
   }
 
   std::vector<std::string> read()
@@ -263,20 +269,19 @@ private:
   rmi::detail::LineBuffer line_buffer_;
 };
 
-RMIConnection::RMIConnection(const std::string& robot_ip_address, const uint16_t rmi_port)
-  : RMIConnectionInterface()
-  , robot_ip_address_{ robot_ip_address }
+Fanuc_driver::Fanuc_driver(const std::string& robot_ip_address, const uint16_t rmi_port)
+  : robot_ip_address_{ robot_ip_address }
   , rmi_port_{ rmi_port }
+  , encoding_{ "UTF-8" }
   , sequence_number_{ 1 }
   , connection_impl_{ std::make_unique<PConnectionImpl>(robot_ip_address, rmi_port) }
   , last_instruction_response_{ std::nullopt }
-  , encoding_{ "UTF-8" }
 {
 }
 
-RMIConnection::~RMIConnection() = default;
+Fanuc_driver::~Fanuc_driver() = default;
 
-void RMIConnection::drainConnectionBuffer()
+void Fanuc_driver::drainConnectionBuffer()
 {
   std::vector<std::string> json_responses = connection_impl_->read();
   while (!json_responses.empty())
@@ -289,7 +294,7 @@ void RMIConnection::drainConnectionBuffer()
   }
 }
 
-bool RMIConnection::processInstructionResponse(std::string& json_response)
+bool Fanuc_driver::processInstructionResponse(std::string& json_response)
 {
   const auto json = IsInstruction(json_response);
 
@@ -309,44 +314,46 @@ bool RMIConnection::processInstructionResponse(std::string& json_response)
 }
 
 template <typename T>
-std::optional<T> RMIConnection::checkForPacketInJSONResponses(std::list<std::string>::iterator& it,
-                                                              std::list<std::string>& json_responses)
+std::optional<T> Fanuc_driver::checkForPacketInJSONResponses(std::list<std::string>::iterator& it,
+                                                             std::list<std::string>& json_responses)
 {
   std::optional<T> packet_response;
-  for (; it != json_responses.end(); ++it)
+  for (; it != json_responses.end();)
   {
-    if (processInstructionResponse(*it))
-    {
-      it = json_responses.erase(it);
-      break;
-    }
     if constexpr (std::is_same_v<T, ReadErrorPacket::Response>)
     {
       if (encoding_ == "SHIFT-JIS")
       {
-        // When the language setting is Japanese on R-30iB Plus series controllers,
-        // the error messages are sent in SHIFT-JIS.
-        std::string converted_string = convertEncoding(*it, encoding_.c_str(), "UTF-8");
-        if (auto packet_response_maybe = FromJSON<T>(converted_string); packet_response_maybe.has_value())
+        // Japanese R-30iB Plus controllers send alarm text in SHIFT-JIS.
+        const auto converted = convertEncoding(*it, encoding_.c_str(), "UTF-8");
+        if (auto response = FromJSON<T>(converted); response.has_value())
         {
-          packet_response = packet_response_maybe.value();
+          packet_response = std::move(response);
           it = json_responses.erase(it);
           break;
         }
       }
     }
-    if (auto packet_response_maybe = FromJSON<T>(*it); packet_response_maybe.has_value())
+    // Match the awaited reply before consuming asynchronous instruction acknowledgements.
+    if (auto response = FromJSON<T>(*it); response.has_value())
     {
-      packet_response = packet_response_maybe.value();
+      processInstructionResponse(*it);
+      packet_response = std::move(response);
       it = json_responses.erase(it);
       break;
     }
+    if (processInstructionResponse(*it))
+    {
+      it = json_responses.erase(it);
+      continue;
+    }
+    ++it;
   }
   return packet_response;
 }
 
 template <typename T>
-std::optional<T> RMIConnection::checkPushPacket()
+std::optional<T> Fanuc_driver::checkPushPacket()
 {
   drainConnectionBuffer();
 
@@ -363,35 +370,46 @@ std::optional<T> RMIConnection::checkPushPacket()
   return packet;
 }
 
-std::optional<SystemFaultPacket> RMIConnection::checkSystemFault()
+std::optional<SystemFaultPacket> Fanuc_driver::checkSystemFault()
 {
   return checkPushPacket<SystemFaultPacket>();
 }
 
-std::optional<TimeoutTerminatePacket> RMIConnection::checkTimeoutTerminate()
+std::optional<TimeoutTerminatePacket> Fanuc_driver::checkTimeoutTerminate()
 {
   return checkPushPacket<TimeoutTerminatePacket>();
 }
 
-std::optional<CommunicationPacket> RMIConnection::checkCommunicationPacket()
+std::optional<CommunicationPacket> Fanuc_driver::checkCommunicationPacket()
 {
   return checkPushPacket<CommunicationPacket>();
 }
 
-std::optional<UnknownPacket> RMIConnection::checkUnknownPacket()
+std::optional<UnknownPacket> Fanuc_driver::checkUnknownPacket()
 {
   return checkPushPacket<UnknownPacket>();
 }
 
-std::optional<InstructionResponse> RMIConnection::getLastInstructionResponse()
+std::optional<InstructionResponse> Fanuc_driver::getLastInstructionResponse()
 {
+  drainConnectionBuffer();
+  {
+    std::scoped_lock lock(mutex_);
+    for (auto it = json_responses_.begin(); it != json_responses_.end();)
+    {
+      if (processInstructionResponse(*it))
+        it = json_responses_.erase(it);
+      else
+        ++it;
+    }
+  }
   std::scoped_lock lock(instruction_mutex_);
   return last_instruction_response_;
 }
 
 template <typename T>
-T RMIConnection::getResponsePacket(const std::optional<double> timeout_optional,
-                                   const std::string& error_message_prefix, std::optional<int> expected_sequence_id)
+T Fanuc_driver::getResponsePacket(const std::optional<double> timeout_optional, const std::string& error_message_prefix,
+                                  std::optional<int> expected_sequence_id)
 {
   if constexpr (requires(T t) { t.SequenceID; })
   {
@@ -443,36 +461,36 @@ T RMIConnection::getResponsePacket(const std::optional<double> timeout_optional,
   return packet_response.value();
 }
 
-int32_t RMIConnection::getSequenceNumber()
+int32_t Fanuc_driver::getSequenceNumber()
 {
   return sequence_number_++;
 }
 
-ConnectROS2Packet::Response RMIConnection::connect(const std::optional<double> timeout)
+ConnectPacket::Response Fanuc_driver::connect(const std::optional<double> timeout)
 {
-  connection_impl_->write(ConnectROS2Packet::Request());
+  connection_impl_->write(ConnectPacket::Request());
   auto connect_response =
-      getResponsePacket<ConnectROS2Packet::Response>(timeout, "Failed to connect to RMI server. ", std::nullopt);
+      getResponsePacket<ConnectPacket::Response>(timeout, "Failed to connect to RMI server. ", std::nullopt);
   // Recreate a TCP to the new port number provided by the server
   connection_impl_->createNewConnection(robot_ip_address_, connect_response.PortNumber);
   return connect_response;
 }
 
-DisconnectPacket::Response RMIConnection::disconnect(const std::optional<double> timeout)
+DisconnectPacket::Response Fanuc_driver::disconnect(const std::optional<double> timeout)
 {
   connection_impl_->write(DisconnectPacket::Request());
   return getResponsePacket<DisconnectPacket::Response>(timeout, "Failed to disconnect from RMI server. ", std::nullopt);
 }
 
-InitializePacket::Response RMIConnection::initializeRemoteMotion(const std::optional<double> timeout)
+InitializePacket::Response Fanuc_driver::initializeRemoteMotion(const std::optional<double> timeout)
 {
   return initializeRemoteMotion(timeout, std::nullopt, std::nullopt, std::nullopt);
 }
 
-InitializePacket::Response RMIConnection::initializeRemoteMotion(const std::optional<double> timeout,
-                                                                 const std::optional<uint8_t> groupmask,
-                                                                 const std::optional<std::string>& rtsa,
-                                                                 const std::optional<std::string>& pltzmode)
+InitializePacket::Response Fanuc_driver::initializeRemoteMotion(const std::optional<double> timeout,
+                                                                const std::optional<uint8_t> groupmask,
+                                                                const std::optional<std::string>& rtsa,
+                                                                const std::optional<std::string>& pltzmode)
 {
   {
     std::scoped_lock lock(mutex_);
@@ -495,13 +513,13 @@ InitializePacket::Response RMIConnection::initializeRemoteMotion(const std::opti
   return getResponsePacket<InitializePacket::Response>(timeout, "Failed to initialize RMI. ", std::nullopt);
 }
 
-ProgramCallPacket::Request RMIConnection::programCallNonBlocking(const std::string& program_name)
+ProgramCallPacket::Request Fanuc_driver::programCallNonBlocking(const std::string& program_name)
 {
   return programCallNonBlocking(program_name, {});
 }
 
-ProgramCallPacket::Request RMIConnection::programCallNonBlocking(const std::string& program_name,
-                                                                 const std::vector<RMICallParam>& params)
+ProgramCallPacket::Request Fanuc_driver::programCallNonBlocking(const std::string& program_name,
+                                                                const std::vector<RMICallParam>& params)
 {
   ProgramCallPacket::Request program_call_packet;
   program_call_packet.ProgramName = program_name;
@@ -512,21 +530,21 @@ ProgramCallPacket::Request RMIConnection::programCallNonBlocking(const std::stri
   return program_call_packet;
 }
 
-ProgramCallPacket::Response RMIConnection::programCall(const std::string& program_name,
-                                                       const std::optional<double> timeout)
+ProgramCallPacket::Response Fanuc_driver::programCall(const std::string& program_name,
+                                                      const std::optional<double> timeout)
 {
   return programCall(program_name, timeout, {});
 }
 
-ProgramCallPacket::Response RMIConnection::programCall(const std::string& program_name, std::optional<double> timeout,
-                                                       const std::vector<RMICallParam>& params)
+ProgramCallPacket::Response Fanuc_driver::programCall(const std::string& program_name, std::optional<double> timeout,
+                                                      const std::vector<RMICallParam>& params)
 {
   ProgramCallPacket::Request program_call_packet = programCallNonBlocking(program_name, params);
   return getResponsePacket<ProgramCallPacket::Response>(
       timeout, "Failed to call program named `" + program_name + "`. ", program_call_packet.SequenceID);
 }
 
-SetSpeedOverridePacket::Response RMIConnection::setSpeedOverride(const int value, const std::optional<double> timeout)
+SetSpeedOverridePacket::Response Fanuc_driver::setSpeedOverride(const int value, const std::optional<double> timeout)
 {
   SetSpeedOverridePacket::Request set_speed_override_packet;
   set_speed_override_packet.Value = value;
@@ -535,44 +553,44 @@ SetSpeedOverridePacket::Response RMIConnection::setSpeedOverride(const int value
                                                              std::nullopt);
 }
 
-StatusRequestPacket::Response RMIConnection::getStatus(const std::optional<double> timeout)
+StatusRequestPacket::Response Fanuc_driver::getStatus(const std::optional<double> timeout)
 {
   connection_impl_->write(StatusRequestPacket::Request());
   return getResponsePacket<StatusRequestPacket::Response>(timeout, "Failed to get status from RMI server. ",
                                                           std::nullopt);
 }
 
-AbortPacket::Response RMIConnection::abort(const std::optional<double> timeout)
+AbortPacket::Response Fanuc_driver::abort(const std::optional<double> timeout)
 {
   connection_impl_->write(AbortPacket::Request());
   return getResponsePacket<AbortPacket::Response>(timeout, "Failed to abort. ", std::nullopt);
 }
 
-PausePacket::Response RMIConnection::pause(const std::optional<double> timeout)
+PausePacket::Response Fanuc_driver::pause(const std::optional<double> timeout)
 {
   connection_impl_->write(PausePacket::Request());
   return getResponsePacket<PausePacket::Response>(timeout, "Failed to pause. ", std::nullopt);
 }
 
-ContinuePacket::Response RMIConnection::resume(const std::optional<double> timeout)
+ContinuePacket::Response Fanuc_driver::resume(const std::optional<double> timeout)
 {
   connection_impl_->write(ContinuePacket::Request());
   return getResponsePacket<ContinuePacket::Response>(timeout, "Failed to continue. ", std::nullopt);
 }
 
-ResetRobotPacket::Response RMIConnection::reset(const std::optional<double> timeout)
+ResetRobotPacket::Response Fanuc_driver::reset(const std::optional<double> timeout)
 {
   connection_impl_->write(ResetRobotPacket::Request());
   return getResponsePacket<ResetRobotPacket::Response>(timeout, "Failed to reset. ", std::nullopt);
 }
 
-ReadErrorPacket::Response RMIConnection::readError(const std::optional<double> timeout)
+ReadErrorPacket::Response Fanuc_driver::readError(const std::optional<double> timeout)
 {
   return readError(timeout, std::nullopt);
 }
 
-ReadErrorPacket::Response RMIConnection::readError(const std::optional<double> timeout,
-                                                   const std::optional<uint8_t> count)
+ReadErrorPacket::Response Fanuc_driver::readError(const std::optional<double> timeout,
+                                                  const std::optional<uint8_t> count)
 {
   const auto packet = [&]() {
     auto request = ReadErrorPacket::Request();
@@ -583,8 +601,8 @@ ReadErrorPacket::Response RMIConnection::readError(const std::optional<double> t
   return getResponsePacket<ReadErrorPacket::Response>(timeout, "Failed to read error. ", std::nullopt);
 }
 
-GetUFrameToolFramePacket::Response RMIConnection::getUFrameUTool(std::optional<double> timeout,
-                                                                 const std::optional<uint8_t> group)
+GetUFrameToolFramePacket::Response Fanuc_driver::getUFrameUTool(std::optional<double> timeout,
+                                                                const std::optional<uint8_t> group)
 {
   auto request = GetUFrameToolFramePacket::Request();
   request.Group = group;
@@ -592,9 +610,9 @@ GetUFrameToolFramePacket::Response RMIConnection::getUFrameUTool(std::optional<d
   return sendRMIPacket<GetUFrameToolFramePacket>(request, timeout);
 }
 
-SetUFrameToolFramePacket::Response RMIConnection::setUFrameUTool(const int uframe, const int utool,
-                                                                 std::optional<double> timeout,
-                                                                 const std::optional<uint8_t> group)
+SetUFrameToolFramePacket::Response Fanuc_driver::setUFrameUTool(const int uframe, const int utool,
+                                                                std::optional<double> timeout,
+                                                                const std::optional<uint8_t> group)
 {
   auto request = SetUFrameToolFramePacket::Request();
   request.UFrameNumber = uframe;
@@ -604,8 +622,8 @@ SetUFrameToolFramePacket::Response RMIConnection::setUFrameUTool(const int ufram
   return sendRMIPacket<SetUFrameToolFramePacket>(request, timeout);
 }
 
-ReadUFrameDataPacket::Response RMIConnection::readUFrameData(const int uframe, std::optional<double> timeout,
-                                                             const std::optional<uint8_t> group)
+ReadUFrameDataPacket::Response Fanuc_driver::readUFrameData(const int uframe, std::optional<double> timeout,
+                                                            const std::optional<uint8_t> group)
 {
   auto request = ReadUFrameDataPacket::Request();
   request.FrameNumber = uframe;
@@ -614,9 +632,9 @@ ReadUFrameDataPacket::Response RMIConnection::readUFrameData(const int uframe, s
   return sendRMIPacket<ReadUFrameDataPacket>(request, timeout);
 }
 
-WriteUFrameDataPacket::Response RMIConnection::writeUFrameData(const int uframe, const FrameData data,
-                                                               std::optional<double> timeout,
-                                                               const std::optional<uint8_t> group)
+WriteUFrameDataPacket::Response Fanuc_driver::writeUFrameData(const int uframe, const FrameData data,
+                                                              std::optional<double> timeout,
+                                                              const std::optional<uint8_t> group)
 {
   auto request = WriteUFrameDataPacket::Request();
   request.FrameNumber = uframe;
@@ -626,8 +644,8 @@ WriteUFrameDataPacket::Response RMIConnection::writeUFrameData(const int uframe,
   return sendRMIPacket<WriteUFrameDataPacket>(request, timeout);
 }
 
-ReadUToolDataPacket::Response RMIConnection::readUToolData(const int utool, std::optional<double> timeout,
-                                                           const std::optional<uint8_t> group)
+ReadUToolDataPacket::Response Fanuc_driver::readUToolData(const int utool, std::optional<double> timeout,
+                                                          const std::optional<uint8_t> group)
 {
   auto request = ReadUToolDataPacket::Request();
   request.ToolNumber = utool;
@@ -636,9 +654,9 @@ ReadUToolDataPacket::Response RMIConnection::readUToolData(const int utool, std:
   return sendRMIPacket<ReadUToolDataPacket>(request, timeout);
 }
 
-WriteUToolDataPacket::Response RMIConnection::writeUToolData(const int utool, const FrameData data,
-                                                             std::optional<double> timeout,
-                                                             const std::optional<uint8_t> group)
+WriteUToolDataPacket::Response Fanuc_driver::writeUToolData(const int utool, const FrameData data,
+                                                            std::optional<double> timeout,
+                                                            const std::optional<uint8_t> group)
 {
   auto request = WriteUToolDataPacket::Request();
   request.ToolNumber = utool;
@@ -649,9 +667,9 @@ WriteUToolDataPacket::Response RMIConnection::writeUToolData(const int utool, co
 }
 
 WritePositionRegisterPacket::Response
-RMIConnection::writePositionRegister(const int register_number, const std::string& representation,
-                                     const ConfigurationData& configuration, const PositionData& position,
-                                     const JointAngleData& joint_angle, const std::optional<double> timeout)
+Fanuc_driver::writePositionRegister(const int register_number, const std::string& representation,
+                                    const ConfigurationData& configuration, const PositionData& position,
+                                    const JointAngleData& joint_angle, const std::optional<double> timeout)
 {
   if (register_number < 1 || register_number > 100)
   {
@@ -677,8 +695,8 @@ RMIConnection::writePositionRegister(const int register_number, const std::strin
                                                                   std::nullopt);
 }
 
-ReadPositionRegisterPacket::Response RMIConnection::readPositionRegister(const int register_number,
-                                                                         const std::optional<double> timeout)
+ReadPositionRegisterPacket::Response Fanuc_driver::readPositionRegister(const int register_number,
+                                                                        const std::optional<double> timeout)
 {
   if (register_number < 1 || register_number > 100)
   {
@@ -692,8 +710,8 @@ ReadPositionRegisterPacket::Response RMIConnection::readPositionRegister(const i
                                                                  std::nullopt);
 }
 
-ReadNumericRegisterPacket::Response RMIConnection::readNumericRegister(const int register_number,
-                                                                       const std::optional<double> timeout)
+ReadNumericRegisterPacket::Response Fanuc_driver::readNumericRegister(const int register_number,
+                                                                      const std::optional<double> timeout)
 {
   if (register_number < 1 || register_number > 200)
   {
@@ -707,9 +725,9 @@ ReadNumericRegisterPacket::Response RMIConnection::readNumericRegister(const int
                                                                 std::nullopt);
 }
 
-WriteNumericRegisterPacket::Response RMIConnection::writeNumericRegister(const int register_number,
-                                                                         const std::variant<int, float> value,
-                                                                         const std::optional<double> timeout)
+WriteNumericRegisterPacket::Response Fanuc_driver::writeNumericRegister(const int register_number,
+                                                                        const std::variant<int, float> value,
+                                                                        const std::optional<double> timeout)
 {
   if (register_number < 1 || register_number > 200)
   {
@@ -725,8 +743,8 @@ WriteNumericRegisterPacket::Response RMIConnection::writeNumericRegister(const i
                                                                  std::nullopt);
 }
 
-ReadDigitalInputPortPacket::Response RMIConnection::readDigitalInputPort(const uint16_t port_number,
-                                                                         const std::optional<double> timeout)
+ReadDigitalInputPortPacket::Response Fanuc_driver::readDigitalInputPort(const uint16_t port_number,
+                                                                        const std::optional<double> timeout)
 {
   ReadDigitalInputPortPacket::Request read_digital_input_port_packet;
   read_digital_input_port_packet.PortNumber = port_number;
@@ -735,9 +753,9 @@ ReadDigitalInputPortPacket::Response RMIConnection::readDigitalInputPort(const u
                                                                  std::nullopt);
 }
 
-WriteDigitalOutputPacket::Response RMIConnection::writeDigitalOutputPort(const uint16_t port_number,
-                                                                         const bool port_value,
-                                                                         const std::optional<double> timeout)
+WriteDigitalOutputPacket::Response Fanuc_driver::writeDigitalOutputPort(const uint16_t port_number,
+                                                                        const bool port_value,
+                                                                        const std::optional<double> timeout)
 {
   WriteDigitalOutputPacket::Request write_digital_output_packet;
   write_digital_output_packet.PortNumber = port_number;
@@ -747,8 +765,8 @@ WriteDigitalOutputPacket::Response RMIConnection::writeDigitalOutputPort(const u
                                                                std::nullopt);
 }
 
-ReadIOPortPacket::Response RMIConnection::readIOPort(const std::string& port_type, const int port_number,
-                                                     const std::optional<double> timeout)
+ReadIOPortPacket::Response Fanuc_driver::readIOPort(const std::string& port_type, const int port_number,
+                                                    const std::optional<double> timeout)
 {
   ReadIOPortPacket::Request read_io_port_packet;
   read_io_port_packet.PortNumber = port_number;
@@ -757,9 +775,9 @@ ReadIOPortPacket::Response RMIConnection::readIOPort(const std::string& port_typ
   return getResponsePacket<ReadIOPortPacket::Response>(timeout, "Failed to read IO port. ", std::nullopt);
 }
 
-WriteIOPortPacket::Response RMIConnection::writeIOPort(const int port_number, const std::string& port_type,
-                                                       const std::variant<int, float> port_value,
-                                                       const std::optional<double> timeout)
+WriteIOPortPacket::Response Fanuc_driver::writeIOPort(const int port_number, const std::string& port_type,
+                                                      const std::variant<int, float> port_value,
+                                                      const std::optional<double> timeout)
 {
   WriteIOPortPacket::Request write_io_port_packet;
   write_io_port_packet.PortNumber = port_number;
@@ -769,8 +787,8 @@ WriteIOPortPacket::Response RMIConnection::writeIOPort(const int port_number, co
   return getResponsePacket<WriteIOPortPacket::Response>(timeout, "Failed to read IO port. ", std::nullopt);
 }
 
-ReadVariablePacket::Response RMIConnection::readVariablePacket(const std::string& variable_name,
-                                                               const std::optional<double> timeout)
+ReadVariablePacket::Response Fanuc_driver::readVariablePacket(const std::string& variable_name,
+                                                              const std::optional<double> timeout)
 {
   ReadVariablePacket::Request read_variable_packet;
   read_variable_packet.VariableName = variable_name;
@@ -779,9 +797,9 @@ ReadVariablePacket::Response RMIConnection::readVariablePacket(const std::string
                                                          std::nullopt);
 }
 
-WriteVariablePacket::Response RMIConnection::writeVariablePacket(const std::string& variable_name,
-                                                                 const std::variant<int, float> value,
-                                                                 const std::optional<double> timeout)
+WriteVariablePacket::Response Fanuc_driver::writeVariablePacket(const std::string& variable_name,
+                                                                const std::variant<int, float> value,
+                                                                const std::optional<double> timeout)
 {
   WriteVariablePacket::Request write_variable_packet;
   write_variable_packet.VariableName = variable_name;
@@ -792,14 +810,14 @@ WriteVariablePacket::Response RMIConnection::writeVariablePacket(const std::stri
                                                           std::nullopt);
 }
 
-GetExtendedStatusPacket::Response RMIConnection::getExtendedStatus(const std::optional<double> timeout)
+GetExtendedStatusPacket::Response Fanuc_driver::getExtendedStatus(const std::optional<double> timeout)
 {
   connection_impl_->write(GetExtendedStatusPacket::Request());
   return getResponsePacket<GetExtendedStatusPacket::Response>(timeout, "Failed to get extended status. ", std::nullopt);
 }
 
-SetPayloadPacket::Response RMIConnection::setPayloadSchedule(const uint8_t payload_schedule_number,
-                                                             const std::optional<double> timeout)
+SetPayloadPacket::Response Fanuc_driver::setPayloadSchedule(const uint8_t payload_schedule_number,
+                                                            const std::optional<double> timeout)
 {
   SetPayloadPacket::Request set_payload_packet;
   set_payload_packet.ScheduleNumber = payload_schedule_number;
@@ -808,10 +826,10 @@ SetPayloadPacket::Response RMIConnection::setPayloadSchedule(const uint8_t paylo
   return getResponsePacket<SetPayloadPacket::Response>(timeout, "Failed to set the payload schedule. ", std::nullopt);
 }
 
-SetPayloadValuePacket::Response RMIConnection::setPayloadValue(const uint8_t payload_schedule_number, const float mass,
-                                                               const float cg_x, const float cg_y, const float cg_z,
-                                                               const bool use_in, const float in_x, const float in_y,
-                                                               const float in_z, const std::optional<double> timeout)
+SetPayloadValuePacket::Response Fanuc_driver::setPayloadValue(const uint8_t payload_schedule_number, const float mass,
+                                                              const float cg_x, const float cg_y, const float cg_z,
+                                                              const bool use_in, const float in_x, const float in_y,
+                                                              const float in_z, const std::optional<double> timeout)
 {
   SetPayloadValuePacket::Request set_payload_value_packet;
   set_payload_value_packet.ScheduleNumber = payload_schedule_number;
@@ -830,10 +848,10 @@ SetPayloadValuePacket::Response RMIConnection::setPayloadValue(const uint8_t pay
   return getResponsePacket<SetPayloadValuePacket::Response>(timeout, "Failed to set the payload value. ", std::nullopt);
 }
 
-SetPayloadCompPacket::Response RMIConnection::setPayloadComp(const uint8_t payload_schedule_number, const float mass,
-                                                             const float cg_x, const float cg_y, const float cg_z,
-                                                             const float in_x, const float in_y, const float in_z,
-                                                             const std::optional<double> timeout)
+SetPayloadCompPacket::Response Fanuc_driver::setPayloadComp(const uint8_t payload_schedule_number, const float mass,
+                                                            const float cg_x, const float cg_y, const float cg_z,
+                                                            const float in_x, const float in_y, const float in_z,
+                                                            const std::optional<double> timeout)
 {
   SetPayloadCompPacket::Request set_payload_comp_packet;
   set_payload_comp_packet.ScheduleNumber = payload_schedule_number;
@@ -850,7 +868,7 @@ SetPayloadCompPacket::Response RMIConnection::setPayloadComp(const uint8_t paylo
                                                            std::nullopt);
 }
 
-GetPayloadPacket::Response RMIConnection::getPayloadSchedule(const std::optional<double> timeout)
+GetPayloadPacket::Response Fanuc_driver::getPayloadSchedule(const std::optional<double> timeout)
 {
   GetPayloadPacket::Request get_payload_packet;
   std::scoped_lock lock(motion_mutex_);
@@ -858,8 +876,8 @@ GetPayloadPacket::Response RMIConnection::getPayloadSchedule(const std::optional
   return getResponsePacket<GetPayloadPacket::Response>(timeout, "Failed to get the payload schedule. ", std::nullopt);
 }
 
-GetPayloadValuePacket::Response RMIConnection::getPayloadValue(const uint16_t payload_schedule_number,
-                                                               const std::optional<double> timeout)
+GetPayloadValuePacket::Response Fanuc_driver::getPayloadValue(const uint16_t payload_schedule_number,
+                                                              const std::optional<double> timeout)
 {
   GetPayloadValuePacket::Request get_payload_value_packet;
   get_payload_value_packet.ScheduleNumber = payload_schedule_number;
@@ -868,8 +886,8 @@ GetPayloadValuePacket::Response RMIConnection::getPayloadValue(const uint16_t pa
   return getResponsePacket<GetPayloadValuePacket::Response>(timeout, "Failed to get the payload value. ", std::nullopt);
 }
 
-GetPayloadCompPacket::Response RMIConnection::getPayloadComp(const uint16_t payload_schedule_number,
-                                                             const std::optional<double> timeout)
+GetPayloadCompPacket::Response Fanuc_driver::getPayloadComp(const uint16_t payload_schedule_number,
+                                                            const std::optional<double> timeout)
 {
   GetPayloadCompPacket::Request get_payload_comp_packet;
   get_payload_comp_packet.ScheduleNumber = payload_schedule_number;
@@ -879,8 +897,8 @@ GetPayloadCompPacket::Response RMIConnection::getPayloadComp(const uint16_t payl
                                                            std::nullopt);
 }
 
-ReadJointAnglesPacket::Response RMIConnection::readJointAngles(const std::optional<uint8_t>& group,
-                                                               const std::optional<double> timeout)
+ReadJointAnglesPacket::Response Fanuc_driver::readJointAngles(const std::optional<uint8_t>& group,
+                                                              const std::optional<double> timeout)
 {
   ReadJointAnglesPacket::Request read_joint_angles_packet;
   read_joint_angles_packet.Group = group;
@@ -888,8 +906,8 @@ ReadJointAnglesPacket::Response RMIConnection::readJointAngles(const std::option
   return getResponsePacket<ReadJointAnglesPacket::Response>(timeout, "Failed to get joint angles. ", std::nullopt);
 }
 
-GetCartesianPositionPacket::Response RMIConnection::getCartesianPosition(std::optional<double> timeout,
-                                                                         const std::optional<uint8_t> group)
+GetCartesianPositionPacket::Response Fanuc_driver::getCartesianPosition(std::optional<double> timeout,
+                                                                        const std::optional<uint8_t> group)
 {
   GetCartesianPositionPacket::Request packet;
   packet.Group = group;
@@ -898,7 +916,7 @@ GetCartesianPositionPacket::Response RMIConnection::getCartesianPosition(std::op
                                                                  std::nullopt);
 }
 
-GetTCPSpeedPacket::Response RMIConnection::getTCPSpeed(std::optional<double> timeout, const std::optional<uint8_t> group)
+GetTCPSpeedPacket::Response Fanuc_driver::getTCPSpeed(std::optional<double> timeout, const std::optional<uint8_t> group)
 {
   GetTCPSpeedPacket::Request packet;
   packet.Group = group;
@@ -906,8 +924,8 @@ GetTCPSpeedPacket::Response RMIConnection::getTCPSpeed(std::optional<double> tim
   return getResponsePacket<GetTCPSpeedPacket::Response>(timeout, "Failed to get TCP speed. ", std::nullopt);
 }
 
-JointMotionJRepPacket::Response RMIConnection::sendJointMotion(JointMotionJRepPacket::Request joint_motion_request,
-                                                               const std::optional<double> timeout)
+JointMotionJRepPacket::Response Fanuc_driver::sendJointMotion(JointMotionJRepPacket::Request joint_motion_request,
+                                                              const std::optional<double> timeout)
 {
   joint_motion_request.SequenceID = getSequenceNumber();
   connection_impl_->write(joint_motion_request);
@@ -915,122 +933,115 @@ JointMotionJRepPacket::Response RMIConnection::sendJointMotion(JointMotionJRepPa
                                                             joint_motion_request.SequenceID);
 }
 
-void RMIConnection::sendRMIPacketNonBlocking(JointMotionPacket::Request& packet)
+void Fanuc_driver::sendRMIPacketNonBlocking(JointMotionPacket::Request& packet)
 {
   sendRMIPacketNonBlockingImpl<JointMotionPacket>(packet);
   return;
 };
-void RMIConnection::sendRMIPacketNonBlocking(JointMotionJRepPacket::Request& packet)
+void Fanuc_driver::sendRMIPacketNonBlocking(JointMotionJRepPacket::Request& packet)
 {
   sendRMIPacketNonBlockingImpl<JointMotionJRepPacket>(packet);
   return;
 };
-void RMIConnection::sendRMIPacketNonBlocking(JointRelativePacket::Request& packet)
+void Fanuc_driver::sendRMIPacketNonBlocking(JointRelativePacket::Request& packet)
 {
   sendRMIPacketNonBlockingImpl<JointRelativePacket>(packet);
   return;
 };
-void RMIConnection::sendRMIPacketNonBlocking(JointRelativeJRepPacket::Request& packet)
+void Fanuc_driver::sendRMIPacketNonBlocking(JointRelativeJRepPacket::Request& packet)
 {
   sendRMIPacketNonBlockingImpl<JointRelativeJRepPacket>(packet);
   return;
 };
-void RMIConnection::sendRMIPacketNonBlocking(LinearMotionPacket::Request& packet)
+void Fanuc_driver::sendRMIPacketNonBlocking(LinearMotionPacket::Request& packet)
 {
   sendRMIPacketNonBlockingImpl<LinearMotionPacket>(packet);
   return;
 };
-void RMIConnection::sendRMIPacketNonBlocking(LinearMotionJRepPacket::Request& packet)
+void Fanuc_driver::sendRMIPacketNonBlocking(LinearMotionJRepPacket::Request& packet)
 {
   sendRMIPacketNonBlockingImpl<LinearMotionJRepPacket>(packet);
   return;
 };
-void RMIConnection::sendRMIPacketNonBlocking(LinearRelativePacket::Request& packet)
+void Fanuc_driver::sendRMIPacketNonBlocking(LinearRelativePacket::Request& packet)
 {
   sendRMIPacketNonBlockingImpl<LinearRelativePacket>(packet);
   return;
 };
-void RMIConnection::sendRMIPacketNonBlocking(LinearRelativeJRepPacket::Request& packet)
+void Fanuc_driver::sendRMIPacketNonBlocking(LinearRelativeJRepPacket::Request& packet)
 {
   sendRMIPacketNonBlockingImpl<LinearRelativeJRepPacket>(packet);
   return;
 };
-void RMIConnection::sendRMIPacketNonBlocking(CircularMotionPacket::Request& packet)
+void Fanuc_driver::sendRMIPacketNonBlocking(CircularMotionPacket::Request& packet)
 {
   sendRMIPacketNonBlockingImpl<CircularMotionPacket>(packet);
   return;
 };
-void RMIConnection::sendRMIPacketNonBlocking(CircularRelativePacket::Request& packet)
+void Fanuc_driver::sendRMIPacketNonBlocking(CircularRelativePacket::Request& packet)
 {
   sendRMIPacketNonBlockingImpl<CircularRelativePacket>(packet);
   return;
 };
-void RMIConnection::sendRMIPacketNonBlocking(SplineMotionPacket::Request& packet)
+void Fanuc_driver::sendRMIPacketNonBlocking(SplineMotionPacket::Request& packet)
 {
   sendRMIPacketNonBlockingImpl<SplineMotionPacket>(packet);
   return;
 };
-void RMIConnection::sendRMIPacketNonBlocking(SplineMotionJRepPacket::Request& packet)
+void Fanuc_driver::sendRMIPacketNonBlocking(SplineMotionJRepPacket::Request& packet)
 {
   sendRMIPacketNonBlockingImpl<SplineMotionJRepPacket>(packet);
   return;
 };
 
-void RMIConnection::sendRMIPacketNonBlocking(WaitForDINPacket::Request& packet)
+void Fanuc_driver::sendRMIPacketNonBlocking(WaitForDINPacket::Request& packet)
 {
   sendRMIPacketNonBlockingImpl<WaitForDINPacket>(packet);
   return;
 };
-void RMIConnection::sendRMIPacketNonBlocking(SetUFramePacket::Request& packet)
+void Fanuc_driver::sendRMIPacketNonBlocking(SetUFramePacket::Request& packet)
 {
   sendRMIPacketNonBlockingImpl<SetUFramePacket>(packet);
   return;
 };
-void RMIConnection::sendRMIPacketNonBlocking(SetToolFramePacket::Request& packet)
+void Fanuc_driver::sendRMIPacketNonBlocking(SetToolFramePacket::Request& packet)
 {
   sendRMIPacketNonBlockingImpl<SetToolFramePacket>(packet);
   return;
 };
-void RMIConnection::sendRMIPacketNonBlocking(WaitForTimePacket::Request& packet)
+void Fanuc_driver::sendRMIPacketNonBlocking(WaitForTimePacket::Request& packet)
 {
   sendRMIPacketNonBlockingImpl<WaitForTimePacket>(packet);
   return;
 };
-void RMIConnection::sendRMIPacketNonBlocking(SetPayloadInstructionPacket::Request& packet)
+void Fanuc_driver::sendRMIPacketNonBlocking(SetPayloadInstructionPacket::Request& packet)
 {
   sendRMIPacketNonBlockingImpl<SetPayloadInstructionPacket>(packet);
   return;
 };
 
-std::string RMIConnection::getErrorMessageString(const uint32_t error_code)
+std::string Fanuc_driver::getErrorMessageString(const uint32_t error_code)
 {
   return LookupErrorCode(error_code);
 }
 
-// Do any operations to read response packets beforehand
-// in order to update last_instruction_response_.
-int32_t RMIConnection::getRemainingBuffuerSize()
+int32_t Fanuc_driver::getRemainingBufferSize()
 {
-#define RMI_MAX_BUFFER_SIZE 8
+  constexpr int32_t kMaxBufferSize = 8;
+  getLastInstructionResponse();
   std::scoped_lock lock(instruction_mutex_);
-  if (last_instruction_response_.has_value())
-  {
-    return RMI_MAX_BUFFER_SIZE - (sequence_number_ - last_instruction_response_.value().SequenceID);
-  }
-  else
-  {
-    return RMI_MAX_BUFFER_SIZE - sequence_number_;
-  }
+  const auto acknowledged = last_instruction_response_ ? last_instruction_response_->SequenceID : 0;
+  return kMaxBufferSize - (sequence_number_ - 1 - acknowledged);
 }
 
-void RMIConnection::setEncoding(const std::string& encoding)
+void Fanuc_driver::setEncoding(const std::string& encoding)
 {
   encoding_ = encoding;
 }
 
 template <typename T>
-typename T::Response RMIConnection::sendRMIPacket(typename T::Request& request_packet,
-                                                  const std::optional<double> timeout)
+typename T::Response Fanuc_driver::sendRMIPacket(typename T::Request& request_packet,
+                                                 const std::optional<double> timeout)
 {
   if constexpr (requires(typename T::Response t) { t.SequenceID; })
   {
@@ -1045,7 +1056,7 @@ typename T::Response RMIConnection::sendRMIPacket(typename T::Request& request_p
 }
 
 template <typename T>
-void RMIConnection::sendRMIPacketNonBlockingImpl(typename T::Request& request_packet)
+void Fanuc_driver::sendRMIPacketNonBlockingImpl(typename T::Request& request_packet)
 {
   if constexpr (requires(typename T::Response t) { t.SequenceID; })
   {
@@ -1060,56 +1071,56 @@ void RMIConnection::sendRMIPacketNonBlockingImpl(typename T::Request& request_pa
 }
 
 template SetUFrameToolFramePacket::Response
-RMIConnection::sendRMIPacket<SetUFrameToolFramePacket>(SetUFrameToolFramePacket::Request&, std::optional<double>);
+Fanuc_driver::sendRMIPacket<SetUFrameToolFramePacket>(SetUFrameToolFramePacket::Request&, std::optional<double>);
 template ReadUFrameDataPacket::Response
-RMIConnection::sendRMIPacket<ReadUFrameDataPacket>(ReadUFrameDataPacket::Request&, std::optional<double>);
+Fanuc_driver::sendRMIPacket<ReadUFrameDataPacket>(ReadUFrameDataPacket::Request&, std::optional<double>);
 template WriteUFrameDataPacket::Response
-RMIConnection::sendRMIPacket<WriteUFrameDataPacket>(WriteUFrameDataPacket::Request&, std::optional<double>);
-template ReadUToolDataPacket::Response RMIConnection::sendRMIPacket<ReadUToolDataPacket>(ReadUToolDataPacket::Request&,
-                                                                                         std::optional<double>);
+Fanuc_driver::sendRMIPacket<WriteUFrameDataPacket>(WriteUFrameDataPacket::Request&, std::optional<double>);
+template ReadUToolDataPacket::Response Fanuc_driver::sendRMIPacket<ReadUToolDataPacket>(ReadUToolDataPacket::Request&,
+                                                                                        std::optional<double>);
 template WriteUToolDataPacket::Response
-RMIConnection::sendRMIPacket<WriteUToolDataPacket>(WriteUToolDataPacket::Request&, std::optional<double>);
+Fanuc_driver::sendRMIPacket<WriteUToolDataPacket>(WriteUToolDataPacket::Request&, std::optional<double>);
 template WriteDigitalOutputPacket::Response
-RMIConnection::sendRMIPacket<WriteDigitalOutputPacket>(WriteDigitalOutputPacket::Request&, std::optional<double>);
+Fanuc_driver::sendRMIPacket<WriteDigitalOutputPacket>(WriteDigitalOutputPacket::Request&, std::optional<double>);
 template ReadJointAnglesPacket::Response
-RMIConnection::sendRMIPacket<ReadJointAnglesPacket>(ReadJointAnglesPacket::Request&, std::optional<double>);
+Fanuc_driver::sendRMIPacket<ReadJointAnglesPacket>(ReadJointAnglesPacket::Request&, std::optional<double>);
 template GetUFrameToolFramePacket::Response
-RMIConnection::sendRMIPacket<GetUFrameToolFramePacket>(GetUFrameToolFramePacket::Request&, std::optional<double>);
-template GetTCPSpeedPacket::Response RMIConnection::sendRMIPacket<GetTCPSpeedPacket>(GetTCPSpeedPacket::Request&,
-                                                                                     std::optional<double>);
-template WaitForDINPacket::Response RMIConnection::sendRMIPacket<WaitForDINPacket>(WaitForDINPacket::Request&,
-                                                                                   std::optional<double>);
-template SetUFramePacket::Response RMIConnection::sendRMIPacket<SetUFramePacket>(SetUFramePacket::Request&,
-                                                                                 std::optional<double>);
-template SetToolFramePacket::Response RMIConnection::sendRMIPacket<SetToolFramePacket>(SetToolFramePacket::Request&,
-                                                                                       std::optional<double>);
-template WaitForTimePacket::Response RMIConnection::sendRMIPacket<WaitForTimePacket>(WaitForTimePacket::Request&,
-                                                                                     std::optional<double>);
-template LinearMotionPacket::Response RMIConnection::sendRMIPacket<LinearMotionPacket>(LinearMotionPacket::Request&,
-                                                                                       std::optional<double>);
+Fanuc_driver::sendRMIPacket<GetUFrameToolFramePacket>(GetUFrameToolFramePacket::Request&, std::optional<double>);
+template GetTCPSpeedPacket::Response Fanuc_driver::sendRMIPacket<GetTCPSpeedPacket>(GetTCPSpeedPacket::Request&,
+                                                                                    std::optional<double>);
+template WaitForDINPacket::Response Fanuc_driver::sendRMIPacket<WaitForDINPacket>(WaitForDINPacket::Request&,
+                                                                                  std::optional<double>);
+template SetUFramePacket::Response Fanuc_driver::sendRMIPacket<SetUFramePacket>(SetUFramePacket::Request&,
+                                                                                std::optional<double>);
+template SetToolFramePacket::Response Fanuc_driver::sendRMIPacket<SetToolFramePacket>(SetToolFramePacket::Request&,
+                                                                                      std::optional<double>);
+template WaitForTimePacket::Response Fanuc_driver::sendRMIPacket<WaitForTimePacket>(WaitForTimePacket::Request&,
+                                                                                    std::optional<double>);
+template LinearMotionPacket::Response Fanuc_driver::sendRMIPacket<LinearMotionPacket>(LinearMotionPacket::Request&,
+                                                                                      std::optional<double>);
 template LinearRelativePacket::Response
-RMIConnection::sendRMIPacket<LinearRelativePacket>(LinearRelativePacket::Request&, std::optional<double>);
-template JointMotionPacket::Response RMIConnection::sendRMIPacket<JointMotionPacket>(JointMotionPacket::Request&,
-                                                                                     std::optional<double>);
-template JointRelativePacket::Response RMIConnection::sendRMIPacket<JointRelativePacket>(JointRelativePacket::Request&,
-                                                                                         std::optional<double>);
+Fanuc_driver::sendRMIPacket<LinearRelativePacket>(LinearRelativePacket::Request&, std::optional<double>);
+template JointMotionPacket::Response Fanuc_driver::sendRMIPacket<JointMotionPacket>(JointMotionPacket::Request&,
+                                                                                    std::optional<double>);
+template JointRelativePacket::Response Fanuc_driver::sendRMIPacket<JointRelativePacket>(JointRelativePacket::Request&,
+                                                                                        std::optional<double>);
 template CircularMotionPacket::Response
-RMIConnection::sendRMIPacket<CircularMotionPacket>(CircularMotionPacket::Request&, std::optional<double>);
+Fanuc_driver::sendRMIPacket<CircularMotionPacket>(CircularMotionPacket::Request&, std::optional<double>);
 template CircularRelativePacket::Response
-RMIConnection::sendRMIPacket<CircularRelativePacket>(CircularRelativePacket::Request&, std::optional<double>);
+Fanuc_driver::sendRMIPacket<CircularRelativePacket>(CircularRelativePacket::Request&, std::optional<double>);
 template JointMotionJRepPacket::Response
-RMIConnection::sendRMIPacket<JointMotionJRepPacket>(JointMotionJRepPacket::Request&, std::optional<double>);
+Fanuc_driver::sendRMIPacket<JointMotionJRepPacket>(JointMotionJRepPacket::Request&, std::optional<double>);
 template JointRelativeJRepPacket::Response
-RMIConnection::sendRMIPacket<JointRelativeJRepPacket>(JointRelativeJRepPacket::Request&, std::optional<double>);
+Fanuc_driver::sendRMIPacket<JointRelativeJRepPacket>(JointRelativeJRepPacket::Request&, std::optional<double>);
 template LinearMotionJRepPacket::Response
-RMIConnection::sendRMIPacket<LinearMotionJRepPacket>(LinearMotionJRepPacket::Request&, std::optional<double>);
+Fanuc_driver::sendRMIPacket<LinearMotionJRepPacket>(LinearMotionJRepPacket::Request&, std::optional<double>);
 template LinearRelativeJRepPacket::Response
-RMIConnection::sendRMIPacket<LinearRelativeJRepPacket>(LinearRelativeJRepPacket::Request&, std::optional<double>);
-template SplineMotionPacket::Response RMIConnection::sendRMIPacket<SplineMotionPacket>(SplineMotionPacket::Request&,
-                                                                                       std::optional<double>);
+Fanuc_driver::sendRMIPacket<LinearRelativeJRepPacket>(LinearRelativeJRepPacket::Request&, std::optional<double>);
+template SplineMotionPacket::Response Fanuc_driver::sendRMIPacket<SplineMotionPacket>(SplineMotionPacket::Request&,
+                                                                                      std::optional<double>);
 template SplineMotionJRepPacket::Response
-RMIConnection::sendRMIPacket<SplineMotionJRepPacket>(SplineMotionJRepPacket::Request&, std::optional<double>);
-template ConnectROS2Packet::Response RMIConnection::sendRMIPacket<ConnectROS2Packet>(ConnectROS2Packet::Request&,
-                                                                                     std::optional<double>);
-
-}  // namespace rmi
+Fanuc_driver::sendRMIPacket<SplineMotionJRepPacket>(SplineMotionJRepPacket::Request&, std::optional<double>);
+template ConnectPacket::Response Fanuc_driver::sendRMIPacket<ConnectPacket>(ConnectPacket::Request&,
+                                                                            std::optional<double>);
+template SetPayloadInstructionPacket::Response
+Fanuc_driver::sendRMIPacket<SetPayloadInstructionPacket>(SetPayloadInstructionPacket::Request&, std::optional<double>);

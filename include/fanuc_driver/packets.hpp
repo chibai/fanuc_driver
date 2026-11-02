@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <variant>
@@ -1246,22 +1247,6 @@ struct GetExtendedStatusPacket
     int DrivesPowered;
     int GenOverride;
     std::optional<float> SpeedClampLimit;
-  };
-};
-
-struct ConnectROS2Packet
-{
-  struct Request
-  {
-    std::string Communication = "FRC_Connect_STMO";
-  };
-  struct Response
-  {
-    std::string Communication = "FRC_Connect_STMO";
-    int ErrorID;
-    uint16_t PortNumber;
-    uint16_t MajorVersion;
-    uint16_t MinorVersion;
   };
 };
 
