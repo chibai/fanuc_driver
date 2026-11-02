@@ -5,16 +5,16 @@
 
 #include <gtest/gtest.h>
 
-#include "rmi/detail/line_buffer.hpp"
-#include "rmi/rmi.hpp"
-#include "rmi/serialization.hpp"
+#include "detail/line_buffer.hpp"
+#include "detail/serialization.hpp"
+#include "fanuc_driver/fanuc_driver.hpp"
 
 TEST(ToJSON, ConnectPacket)
 {
-  const std::string expected_connect_packet_json = R"({Communication:"FRC_Connect}")";
+  const std::string expected_connect_packet_json = R"({"Communication":"FRC_Connect"})";
   const rmi::ConnectPacket::Request connect_packet;
   const std::string connect_packet_json = rmi::ToJSON(connect_packet);
-  EXPECT_EQ(expected_connect_packet_json, expected_connect_packet_json);
+  EXPECT_EQ(connect_packet_json, expected_connect_packet_json);
 }
 
 TEST(FromJSON, ConnectPacketResponse)

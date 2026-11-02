@@ -8,7 +8,7 @@
 #include <optional>
 #include <string>
 
-#include "rmi/struct.hpp"
+#include "fanuc_driver/types.hpp"
 
 namespace rmi
 {
