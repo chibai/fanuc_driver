@@ -8,11 +8,7 @@ A C++23 robot driver library for FANUC controllers.
 CMakeLists.txt     top-level build, install and package export
 cmake/             package config template
 src/
-  rmi/             Remote Motion Interface implementation
-  stream_motion/   Stream Motion implementation
-  fanuc_driver/    Unified fanuc_driver class and GPIO configuration
-  fanuc_client/    GPIO buffer implementation and legacy compatibility entry points
-  gpio_config/     YAML GPIO configuration implementation
+  fanuc_driver/    Driver API, protocol implementations, buffers and tests
 examples/          Example programs
 third_party/       Vendored dependencies (git submodules) and patches
 docs/              Additional documentation
@@ -35,9 +31,9 @@ target_link_libraries(my_app PRIVATE fanuc_driver::fanuc_driver)
 ```
 
 The exported target is the single library entry point and propagates C++23 and
-Eigen3 requirements to consumers. RMI, Stream Motion, GPIO configuration and
-legacy compatibility code are built into this library; they do not have
-protocol-specific CMake targets.
+Eigen3 requirements to consumers. RMI and Stream Motion implementations are
+part of this module; there are no protocol-specific CMake targets or source
+modules.
 
 ```cpp
 #include <fanuc_driver/fanuc_driver.hpp>
@@ -69,35 +65,14 @@ the controller must have the corresponding TP program installed. Raw RMI motion
 and program calls are rejected while streaming; non-motion RMI IO and diagnostics
 remain available. RMI and Stream Motion packet formats are unchanged.
 
-GPIO can be configured programmatically with `fanuc_driver::GPIOConfig` or from
-YAML using `loadGPIOConfig()`. For example, with [examples/gpio.yaml](examples/gpio.yaml):
-
-```cpp
-fanuc_driver driver("192.168.1.100");
-driver.loadGPIOConfig("examples/gpio.yaml");
-driver.setDoMotnCtrl(false);  // IO-only streaming; do not start motion control.
-driver.startRealtimeStream();
-
-using Command = fanuc_driver::GPIOBuffer::CommandGPIOTypes;
-using State = fanuc_driver::GPIOBuffer::StatusGPIOTypes;
-driver.writeGPIO<Command::DO, bool>(1, true);
-if (!driver.sendIOCommand())
-{
-  throw std::runtime_error("Unable to enqueue GPIO command");
-}
-// Status is asynchronous; an immediate read may precede the output update.
-const bool output = driver.readGPIO<State::DO, bool>(1);
-driver.stopRealtimeStream();
-```
-
-GPIO ranges use 1-based controller indices. Configuration is validated before
-being committed; unsupported, overlapping, zero-length or oversized ranges
-throw. Configure GPIO only while stopped. Configuration survives stream restarts;
-`configureGPIO(fanuc_driver::GPIOConfig{})` explicitly clears it.
-The typed `writeGPIO` methods update the command buffer; `sendIOCommand()` queues
-it for transmission. `readGPIO`, `readRobotStatus` and `readForceSensor` refresh
-cached state from the receive queue. Joint-angle reads return views into driver
-storage; copy them (or use Eigen's `.eval()`) to retain a snapshot.
+Realtime GPIO buffers are optional. If needed, create a
+`fanuc_driver::GPIOBuffer::Builder`, add command/status ranges, wrap
+`builder.build()` with `std::make_shared<fanuc_driver::GPIOBuffer>(...)`, and
+pass it to `startRealtimeStream()`. The separate YAML configuration module has
+been removed; RMI I/O methods do not need a realtime GPIO buffer.
+`readRobotStatus` and `readForceSensor` refresh cached state from the receive
+queue. Joint-angle reads return views into driver storage; copy them (or use
+Eigen's `.eval()`) to retain a snapshot.
 
 Call the control/configuration/read/write API from one application thread; the
 internal worker exchanges commands and status through SPSC queues. Atomic
@@ -110,20 +85,17 @@ terminate the process. Use `checkStreamError()` after a streaming loop to rethro
 the original failure; state reads and `stopRealtimeStream()` also report errors.
 Restarting the stream clears old queues and worker errors.
 
-The motion example is [examples/fanuc_driver_example.cpp](examples/fanuc_driver_example.cpp)
-(`build/examples/fanuc_driver_example`). It **moves the robot**; review it and
-ensure the controller is prepared before running it.
+The unified motion example is [examples/fanuc_driver_example.cpp](examples/fanuc_driver_example.cpp)
+(`build/fanuc_driver_example`). It **moves the robot**; review it and ensure the
+controller is prepared before running it.
 
 ## Compatibility
 
 Existing source using `<fanuc_client/fanuc_client.hpp>` and
-`fanuc_client::FanucClient` continues to work through a type alias. Rebuild
-consumers after upgrading; binary compatibility is not maintained.
-The global `FanucClient::get_instance()` entry point was removed: pass driver
-references explicitly. `RMISingleton` remains a legacy standalone utility, but
-constructing a driver no longer registers a connection with it.
-Lower-level protocol headers remain available for advanced use, but link
-consumers to `fanuc_driver::fanuc_driver`.
+`fanuc_client::FanucClient` continues to work through a compatibility alias.
+Rebuild consumers after upgrading; binary compatibility is not maintained.
+The global singleton entry points were removed: create a `fanuc_driver` instance
+and pass it explicitly. Link consumers to `fanuc_driver::fanuc_driver`;
+protocol implementation headers are internal to the unified module.
 
-Requires Eigen3 and a C++23 compiler. See [docs/stream_motion.md](docs/stream_motion.md)
-for the low-level UDP interface.
+Requires Eigen3 and a C++23 compiler.

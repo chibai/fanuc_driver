@@ -10,7 +10,6 @@
 #include <chrono>
 #include <concepts>
 #include <cstdint>
-#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
@@ -21,12 +20,11 @@
 
 #include <Eigen/Core>
 
-#include "fanuc_client/gpio_buffer.hpp"
-#include "gpio_config/gpio_config.hpp"
-#include "rmi/rmi.hpp"
-#include "stream_motion/stream.hpp"
+#include "fanuc_driver/detail/rmi/rmi.hpp"
+#include "fanuc_driver/detail/stream_motion/stream.hpp"
+#include "fanuc_driver/gpio_buffer.hpp"
 
-namespace fanuc_client
+namespace fanuc_driver_detail
 {
 
 enum class ContactStopMode
@@ -59,16 +57,15 @@ struct ForceSensor
   uint32_t fs_type{};
 };
 
-}  // namespace fanuc_client
+}  // namespace fanuc_driver_detail
 
 class fanuc_driver final
 {
 public:
-  using GPIOBuffer = fanuc_client::GPIOBuffer;
-  using RobotStatus = fanuc_client::RobotStatus;
-  using ForceSensor = fanuc_client::ForceSensor;
-  using ContactStopMode = fanuc_client::ContactStopMode;
-  using GPIOConfig = gpio_config::GPIOConfig;
+  using GPIOBuffer = fanuc_driver_detail::GPIOBuffer;
+  using RobotStatus = fanuc_driver_detail::RobotStatus;
+  using ForceSensor = fanuc_driver_detail::ForceSensor;
+  using ContactStopMode = fanuc_driver_detail::ContactStopMode;
 
   fanuc_driver() = delete;
   explicit fanuc_driver(std::string robot_ip, uint16_t stream_motion_port = 60015, uint16_t rmi_port = 16001,
@@ -92,10 +89,6 @@ public:
   Eigen::Ref<const Eigen::VectorXd> readJointAnglesRMI();
 
   [[nodiscard]] bool sendIOCommand() const;
-
-  void configureGPIO(const gpio_config::GPIOConfig& config);
-
-  void loadGPIOConfig(const std::filesystem::path& path);
 
   template <GPIOBuffer::CommandGPIOTypes Type, typename T = GPIOBuffer::CommandValue<Type>>
     requires std::same_as<T, GPIOBuffer::CommandValue<Type>>

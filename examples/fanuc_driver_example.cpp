@@ -25,14 +25,6 @@ int main()
     std::vector<double> jerk_limit;
     driver.getLimits(v_peak, payload, vel_limit, acc_limit, jerk_limit);
 
-    // Configure IO
-    fanuc_driver::GPIOConfig gpio_config;
-    gpio_config.gpio_topic_config.num_reg_cmd = { { .start = 1, .length = 10 } };
-    gpio_config.gpio_topic_config.num_reg_state = { { .start = 1, .length = 10 } };
-    driver.configureGPIO(gpio_config);
-    using Command = fanuc_driver::GPIOBuffer::CommandGPIOTypes;
-    using State = fanuc_driver::GPIOBuffer::StatusGPIOTypes;
-
     driver.startRMI();
     Eigen::VectorXd initial_command = Eigen::VectorXd::Zero(9);
     initial_command[4] = -90;
@@ -52,21 +44,6 @@ int main()
       const double omega = 2 * std::numbers::pi / (static_cast<double>(period) / 1000);
       current_command.array() = initial_command.array() + 20.0 * (1 + -cos(time * omega));
       driver.writeJointTarget(current_command);
-
-      const auto value = static_cast<float>(time);
-      for (int i = 1; i <= 10; ++i)
-      {
-        driver.writeGPIO<Command::FloatReg, float>(i, value + i - 1);
-      }
-      if (!driver.sendIOCommand())
-      {
-        throw std::runtime_error("Unable to enqueue GPIO command.");
-      }
-
-      for (int i = 1; i <= 10; ++i)
-      {
-        std::cout << "reg value " << i << ": " << driver.readGPIO<State::FloatReg, float>(i) << std::endl;
-      }
 
       std::this_thread::sleep_for(std::chrono::microseconds(10 * driver.getControlPeriod()));
     }

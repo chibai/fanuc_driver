@@ -12,9 +12,8 @@
 #include <mutex>
 #include <utility>
 
-#include "fanuc_client/gpio_buffer.hpp"
 #include "readerwriterqueue.h"
-#include "stream_motion/packets.hpp"
+#include "fanuc_driver/detail/stream_motion/packets.hpp"
 
 namespace
 {
