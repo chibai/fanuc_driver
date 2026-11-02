@@ -96,6 +96,7 @@ Existing source using `<fanuc_client/fanuc_client.hpp>` and
 Rebuild consumers after upgrading; binary compatibility is not maintained.
 The global singleton entry points were removed: create a `fanuc_driver` instance
 and pass it explicitly. Link consumers to `fanuc_driver::fanuc_driver`;
-protocol implementation headers are internal to the unified module.
+protocol detail headers live under `fanuc_driver/detail` and are not separate
+modules or build targets.
 
 Requires Eigen3 and a C++23 compiler.
