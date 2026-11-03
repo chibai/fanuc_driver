@@ -26,6 +26,8 @@ cmake/                  安装包配置
 third_party/            sockpp、reflect-cpp 及构建补丁
 ```
 
+完整的公开接口、参数和数据类型说明见 [接口文档](docs/API.md)。
+
 ## 构建
 
 需要支持 C++23 的编译器、CMake 3.22+ 和 Git。运行环境需有 RMI 功能的控制器。
