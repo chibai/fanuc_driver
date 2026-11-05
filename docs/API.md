@@ -15,7 +15,9 @@ find_package(fanuc_driver 3 REQUIRED)
 target_link_libraries(my_app PRIVATE fanuc_driver::fanuc_driver)
 ```
 
-项目要求 C++23。构建示例和测试的项目命令见仓库根目录的 README。
+项目要求支持 `std::expected` 的 C++23 编译器与标准库，构建时需要 Boost 1.74+
+开发头文件。TCP 使用 `boost::asio`（C++23 尚无 `std::asio`），Boost 是私有实现依赖，
+安装包使用者不需要在公开 API 中包含或链接 Boost。构建示例和测试的项目命令见仓库根目录的 README。
 
 ## 2. 连接和典型调用顺序
 
@@ -54,6 +56,9 @@ int main()
 `connect()` 返回 `rmi::ConnectPacket::Response`，其中包括协商到的 `PortNumber` 和控制器 RMI `MajorVersion` / `MinorVersion`。成功后可进行状态、读写或运动调用。`disconnect()` 结束 RMI 会话；析构函数只释放 TCP 资源，不发送停止、复位或断开命令。不要依赖析构函数作为机器人停止机制。
 
 一个 `Fanuc_driver` 对象不可复制或移动，内部连接和指令序号由对象独立持有。虽然实现内部对部分共享状态加锁，同一实例仍建议只由一个应用线程调用；该库不提供轮询线程、运动控制循环或实时流接口。
+Asio 异步操作在调用线程中由 `io_context` 驱动；同步接口等待网络事件而非忙轮询。
+`check*` 只处理已就绪的数据，不等待新包。TCP 发送使用组合写操作处理短写，
+接收支持 CRLF 半包与粘包；切换会话端口会清除旧连接未完成的帧。
 
 ## 3. 通用约定
 
@@ -61,6 +66,8 @@ int main()
 
 - 具有 `timeout` 参数的方法以**秒**计时；省略参数或传入 `std::nullopt` 时等待 1 秒。
 - 传入负值表示不设响应等待期限。超时只控制等待响应，不会取消已经发送给控制器的命令。
+- 超时必须是有限值；NaN 和无穷大抛出 `std::invalid_argument`。超时后保留待接收数据，
+  后续调用可继续收取响应。超时不限制 DNS 解析、TCP 建连或发送所花的时间。
 - TCP 连接/读写失败、响应超时以及控制器响应中的非零 `ErrorID` 会以异常报告，通常为 `std::runtime_error`。写调用方应在应用边界捕获异常并决定如何处理。
 - `getErrorMessageString(code)` 将已知 RMI 错误码转换为文本；未知值返回带错误码的说明。控制器产生的报警文本由 `readError()` 获取，与接口抛出的 `ErrorID` 异常不同。
 - `readError(timeout, count)` 的 `count` 是可选的，协议响应中的有效范围为 1–5；具体控制器版本也可能限制可读报警数。
@@ -148,7 +155,7 @@ int main()
 | `programCall(program_name, timeout, params)` | 同步调用并传递参数 |
 | `programCallNonBlocking(program_name)` / `programCallNonBlocking(program_name, params)` | 发送调用请求后立即返回已分配序号的 `ProgramCallPacket::Request` |
 
-参数类型为 `std::vector<rmi::RMICallParam>`；每个元素是 `std::pair<std::string, std::variant<int, float, std::string>>`，依次对应 RMI 的 `ParamTypeN` 和 `ParamValueN`。最多传 10 个参数，调用方必须确保数量不超过 10。
+参数类型为 `std::vector<rmi::RMICallParam>`；每个元素是 `std::pair<std::string, std::variant<int, float, std::string>>`，依次对应 RMI 的 `ParamTypeN` 和 `ParamValueN`。最多传 10 个参数，超过时在发送前抛出 `std::invalid_argument`，不再静默丢弃多余参数。
 
 ```cpp
 const std::vector<rmi::RMICallParam> args{

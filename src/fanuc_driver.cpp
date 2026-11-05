@@ -11,14 +11,19 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
+#include <expected>
 #include <iostream>
+#include <iterator>
 #include <mutex>
+#include <ranges>
+#include <span>
 #include <sstream>
 #include <system_error>
+#include <utility>
 
+#include <boost/asio.hpp>
 #include "fanuc_driver/packets.hpp"
-#include "sockpp/inet_address.h"
-#include "sockpp/tcp_connector.h"
 
 using namespace rmi;
 
@@ -86,10 +91,7 @@ constexpr std::array<std::pair<uint32_t, std::string_view>, 55> kErrorCodes = {
 
 std::string LookupErrorCode(const uint32_t error_code)
 {
-  if (const auto it = std::ranges::find_if(kErrorCodes,
-                                           [error_code](const std::pair<uint32_t, std::string_view>& error) {
-                                             return error.first == error_code;
-                                           });
+  if (const auto it = std::ranges::find(kErrorCodes, error_code, &decltype(kErrorCodes)::value_type::first);
       it != kErrorCodes.end())
   {
     return std::string(it->second);
@@ -130,83 +132,39 @@ std::string convertEncoding(const std::string& input, const char* from, const ch
   return output;
 }
 
-void addCallArguments(ProgramCallPacket::Request& packet, const std::vector<RMICallParam>& params)
+void addCallArguments(ProgramCallPacket::Request& packet, const std::span<const RMICallParam> params)
 {
-  auto const params_num = params.size();
-  int i = 0;
-  if (params_num <= 0)
-    return;
-
-  packet.ParamType1 = params[i].first;
-  packet.ParamValue1 = params[i].second;
-  i++;
-  if (params_num == i)
-    return;
-
-  packet.ParamType2 = params[i].first;
-  packet.ParamValue2 = params[i].second;
-  i++;
-  if (params_num == i)
-    return;
-
-  packet.ParamType3 = params[i].first;
-  packet.ParamValue3 = params[i].second;
-  i++;
-  if (params_num == i)
-    return;
-
-  packet.ParamType4 = params[i].first;
-  packet.ParamValue4 = params[i].second;
-  i++;
-  if (params_num == i)
-    return;
-
-  packet.ParamType5 = params[i].first;
-  packet.ParamValue5 = params[i].second;
-  i++;
-  if (params_num == i)
-    return;
-
-  packet.ParamType6 = params[i].first;
-  packet.ParamValue6 = params[i].second;
-  i++;
-  if (params_num == i)
-    return;
-
-  packet.ParamType7 = params[i].first;
-  packet.ParamValue7 = params[i].second;
-  i++;
-  if (params_num == i)
-    return;
-
-  packet.ParamType8 = params[i].first;
-  packet.ParamValue8 = params[i].second;
-  i++;
-  if (params_num == i)
-    return;
-
-  packet.ParamType9 = params[i].first;
-  packet.ParamValue9 = params[i].second;
-  i++;
-  if (params_num == i)
-    return;
-
-  packet.ParamType10 = params[i].first;
-  packet.ParamValue10 = params[i].second;
-  return;
+  using Request = ProgramCallPacket::Request;
+  constexpr std::array fields{
+    std::pair{ &Request::ParamType1, &Request::ParamValue1 }, std::pair{ &Request::ParamType2, &Request::ParamValue2 },
+    std::pair{ &Request::ParamType3, &Request::ParamValue3 }, std::pair{ &Request::ParamType4, &Request::ParamValue4 },
+    std::pair{ &Request::ParamType5, &Request::ParamValue5 }, std::pair{ &Request::ParamType6, &Request::ParamValue6 },
+    std::pair{ &Request::ParamType7, &Request::ParamValue7 }, std::pair{ &Request::ParamType8, &Request::ParamValue8 },
+    std::pair{ &Request::ParamType9, &Request::ParamValue9 }, std::pair{ &Request::ParamType10, &Request::ParamValue10 }
+  };
+  if (params.size() > fields.size())
+    throw std::invalid_argument("RMI program calls support at most 10 arguments.");
+  for (const auto& [param, field] : std::views::zip(params, fields))
+  {
+    packet.*field.first = param.first;
+    packet.*field.second = param.second;
+  }
 }
 
 }  // namespace
 
 struct Fanuc_driver::PConnectionImpl
 {
+  using Clock = std::chrono::steady_clock;
+  using IOResult = std::expected<std::size_t, boost::system::error_code>;
+
   PConnectionImpl(const std::string& robot_ip_address, const uint16_t robot_port)
   {
     createNewConnection(robot_ip_address, robot_port);
   }
 
   template <typename T>
-  void write(const T& value, const std::string encoding = "UTF-8")
+  void write(const T& value, const std::string& encoding = "UTF-8")
   {
     const std::string json_string = [&]() {
       std::string json_str = ToJSON(value) + kEndChars;
@@ -220,52 +178,106 @@ struct Fanuc_driver::PConnectionImpl
       return json_str;
     }();
     std::scoped_lock lock(mutex_);
-    const auto result = conn.write(json_string);
-    if (!result)
-      throw std::runtime_error("Failed to write to RMI TCP connection: " + result.error_message());
-    if (result.value() != json_string.size())
-      throw std::runtime_error("Incomplete write to RMI TCP connection.");
+    std::optional<IOResult> result;
+    boost::asio::async_write(socket_, boost::asio::buffer(json_string),
+                             [&result](const boost::system::error_code error, const std::size_t size) {
+                               result = error ? IOResult(std::unexpected(error)) : IOResult(size);
+                             });
+    context_.restart();
+    while (!result)
+      context_.run_one();
+    if (!*result)
+      throw std::runtime_error("Failed to write to RMI TCP connection: " + result->error().message());
   }
 
   void createNewConnection(const std::string& robot_ip_address, const uint16_t robot_port)
   {
-    const sockpp::inet_address server_address(robot_ip_address, robot_port);
     std::scoped_lock lock(mutex_);
-    if (!conn.connect(server_address))
+    boost::asio::ip::tcp::resolver resolver(context_);
+    boost::system::error_code error;
+    const auto endpoints = resolver.resolve(robot_ip_address, std::to_string(robot_port), error);
+    if (error)
+      throw std::runtime_error("Failed to resolve RMI server " + robot_ip_address + ": " + error.message());
+
+    // Drain cancellation handlers before replacing buffers used by the old session.
+    if (socket_.is_open())
     {
-      throw std::runtime_error("Failed to create TCP connection at: " + robot_ip_address);
+      socket_.close(error);
+      if (error)
+        throw std::runtime_error("Failed to close RMI TCP connection: " + error.message());
     }
-    if (const auto result = conn.set_non_blocking(true); !result)
-      throw std::runtime_error("Failed to set RMI TCP connection to non-blocking mode: " + result.error_message());
+    context_.restart();
+    context_.run();
+    read_result_.reset();
+    read_pending_ = false;
+    line_buffer_ = {};
+
+    boost::asio::connect(socket_, endpoints, error);
+    if (error)
+      throw std::runtime_error("Failed to create TCP connection at " + robot_ip_address + ":" +
+                               std::to_string(robot_port) + ": " + error.message());
   }
 
   std::vector<std::string> read()
   {
-    char buf[2048];
     std::scoped_lock lock(mutex_);
-    const sockpp::result<size_t> res = conn.read(buf, sizeof(buf));
-    if (res.is_error())
+    std::vector<std::string> lines;
+    startRead();
+    context_.restart();
+    context_.poll();
+    while (read_result_)
     {
-      const auto error = res.error().default_error_condition();
-      if (error == std::errc::resource_unavailable_try_again || error == std::errc::operation_would_block)
+      if (!*read_result_)
       {
-        return {};
+        // Deliver complete frames before reporting a following EOF on the next call.
+        if (!lines.empty())
+          return lines;
+        if (read_result_->error() == boost::asio::error::eof)
+          throw std::runtime_error("RMI TCP connection was closed by the controller.");
+        throw std::runtime_error("Failed to read from RMI TCP connection: " + read_result_->error().message());
       }
-      throw std::runtime_error("Failed to read from RMI TCP connection: " + res.error_message());
+      auto frames = line_buffer_.append(std::string_view(read_buffer_.data(), read_result_->value()));
+      lines.insert(lines.end(), std::make_move_iterator(frames.begin()), std::make_move_iterator(frames.end()));
+      read_result_.reset();
+      startRead();
+      context_.restart();
+      context_.poll();
     }
-
-    if (res.value() == 0)
-    {
-      throw std::runtime_error("RMI TCP connection was closed by the controller.");
-    }
-
-    return line_buffer_.append(std::string_view(buf, res.value()));
+    return lines;
   }
 
-  sockpp::tcp_connector conn;
+  void waitForData(const std::optional<Clock::time_point> deadline)
+  {
+    std::scoped_lock lock(mutex_);
+    startRead();
+    if (read_result_)
+      return;
+    context_.restart();
+    if (deadline)
+      context_.run_one_until(*deadline);
+    else
+      context_.run_one();
+  }
 
 private:
-  mutable std::mutex mutex_;
+  void startRead()
+  {
+    if (read_pending_ || read_result_)
+      return;
+    read_pending_ = true;
+    socket_.async_read_some(boost::asio::buffer(read_buffer_),
+                            [this](const boost::system::error_code error, const std::size_t size) {
+                              read_pending_ = false;
+                              read_result_ = error ? IOResult(std::unexpected(error)) : IOResult(size);
+                            });
+  }
+
+  boost::asio::io_context context_;
+  boost::asio::ip::tcp::socket socket_{ context_ };
+  std::mutex mutex_;
+  std::array<char, 2048> read_buffer_{};
+  bool read_pending_ = false;
+  std::optional<IOResult> read_result_;
   rmi::detail::LineBuffer line_buffer_;
 };
 
@@ -283,15 +295,10 @@ Fanuc_driver::~Fanuc_driver() = default;
 
 void Fanuc_driver::drainConnectionBuffer()
 {
-  std::vector<std::string> json_responses = connection_impl_->read();
-  while (!json_responses.empty())
-  {
-    {
-      std::scoped_lock lock(mutex_);
-      json_responses_.insert(json_responses_.end(), json_responses.begin(), json_responses.end());
-    }
-    json_responses = connection_impl_->read();
-  }
+  auto json_responses = connection_impl_->read();
+  std::scoped_lock lock(mutex_);
+  json_responses_.insert(json_responses_.end(), std::make_move_iterator(json_responses.begin()),
+                         std::make_move_iterator(json_responses.end()));
 }
 
 bool Fanuc_driver::processInstructionResponse(std::string& json_response)
@@ -315,7 +322,8 @@ bool Fanuc_driver::processInstructionResponse(std::string& json_response)
 
 template <typename T>
 std::optional<T> Fanuc_driver::checkForPacketInJSONResponses(std::list<std::string>::iterator& it,
-                                                             std::list<std::string>& json_responses)
+                                                             std::list<std::string>& json_responses,
+                                                             const std::optional<int> expected_sequence_id)
 {
   std::optional<T> packet_response;
   for (; it != json_responses.end();)
@@ -338,6 +346,11 @@ std::optional<T> Fanuc_driver::checkForPacketInJSONResponses(std::list<std::stri
     if (auto response = FromJSON<T>(*it); response.has_value())
     {
       processInstructionResponse(*it);
+      if (expected_sequence_id && !CheckSequenceIDIfPresent(*response, *expected_sequence_id))
+      {
+        it = json_responses.erase(it);
+        continue;
+      }
       packet_response = std::move(response);
       it = json_responses.erase(it);
       break;
@@ -419,10 +432,21 @@ T Fanuc_driver::getResponsePacket(const std::optional<double> timeout_optional, 
     }
   }
 
-  const double timeout = timeout_optional.has_value() ? timeout_optional.value() : 1.0;
+  const double timeout = timeout_optional.value_or(1.0);
+  if (!std::isfinite(timeout))
+    throw std::invalid_argument("RMI response timeout must be finite; use a negative value for unlimited waiting.");
   std::optional<T> packet_response;
 
   const auto start_time = std::chrono::steady_clock::now();
+  const auto deadline = [&]() -> std::optional<PConnectionImpl::Clock::time_point> {
+    if (timeout < 0.0)
+      return std::nullopt;
+    const auto max_wait = PConnectionImpl::Clock::time_point::max() - start_time;
+    if (timeout >= std::chrono::duration<double>(max_wait).count())
+      return PConnectionImpl::Clock::time_point::max();
+    return start_time +
+           std::chrono::duration_cast<PConnectionImpl::Clock::duration>(std::chrono::duration<double>(timeout));
+  }();
   while (!packet_response.has_value() ||
          (expected_sequence_id.has_value() &&
           !CheckSequenceIDIfPresent(packet_response.value(), expected_sequence_id.value())))
@@ -446,11 +470,13 @@ T Fanuc_driver::getResponsePacket(const std::optional<double> timeout_optional, 
     }
 
     drainConnectionBuffer();
-    std::scoped_lock lock(mutex_);
-    if (auto it = json_responses_.begin(); !json_responses_.empty())
     {
-      packet_response = checkForPacketInJSONResponses<T>(it, json_responses_);
+      std::scoped_lock lock(mutex_);
+      if (auto it = json_responses_.begin(); !json_responses_.empty())
+        packet_response = checkForPacketInJSONResponses<T>(it, json_responses_, expected_sequence_id);
     }
+    if (!packet_response || (expected_sequence_id && !CheckSequenceIDIfPresent(*packet_response, *expected_sequence_id)))
+      connection_impl_->waitForData(deadline);
   }
 
   if (packet_response.value().ErrorID != 0)

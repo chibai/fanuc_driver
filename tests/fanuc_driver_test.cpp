@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <exception>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -9,8 +10,8 @@
 #include <utility>
 #include <vector>
 
+#include <boost/asio.hpp>
 #include "fanuc_driver/fanuc_driver.hpp"
-#include "sockpp/tcp_acceptor.h"
 
 using namespace std::chrono_literals;
 
@@ -20,23 +21,30 @@ struct Exchange
 {
   std::string command;
   std::string response;
+  std::chrono::milliseconds delay{ 0 };
+  std::size_t fragment_size = 0;
+  bool close = false;
+  bool terminate_frame = true;
 };
 
 class Controller
 {
 public:
-  explicit Controller(std::vector<Exchange> exchanges)
-    : listener_(sockpp::inet_address("127.0.0.1", 0))
-    , session_(sockpp::inet_address("127.0.0.1", 0))
-    , worker_([this, exchanges = std::move(exchanges)](std::stop_token stop) {
+  explicit Controller(std::vector<Exchange> exchanges, std::string handshake_trailer = {})
+    : listener_(context_, { boost::asio::ip::make_address("127.0.0.1"), 0 })
+    , session_(context_, { boost::asio::ip::make_address("127.0.0.1"), 0 })
+    , worker_([this, exchanges = std::move(exchanges),
+               handshake_trailer = std::move(handshake_trailer)](std::stop_token stop) {
       try
       {
         auto handshake = accept(listener_, stop);
         const auto request = readLine(handshake);
         if (request != R"({"Communication":"FRC_Connect"})")
           throw std::runtime_error("Expected standard RMI handshake, got: " + request);
-        write(handshake, R"({"Communication":"FRC_Connect","ErrorID":0,"PortNumber":)" +
-                             std::to_string(session_.address().port()) + R"(,"MajorVersion":3,"MinorVersion":1})");
+        writeBytes(handshake, R"({"Communication":"FRC_Connect","ErrorID":0,"PortNumber":)" +
+                                  std::to_string(session_.local_endpoint().port()) +
+                                  R"(,"MajorVersion":3,"MinorVersion":1})" + "\r\n" + handshake_trailer);
+        handshake.close();
         auto connection = accept(session_, stop);
         for (const auto& exchange : exchanges)
         {
@@ -44,8 +52,21 @@ public:
           requests_.push_back(request);
           if (request.find(exchange.command) == std::string::npos)
             throw std::runtime_error("Unexpected RMI request: " + request);
+          std::this_thread::sleep_for(exchange.delay);
           if (!exchange.response.empty())
-            write(connection, exchange.response);
+          {
+            const auto bytes = exchange.response + (exchange.terminate_frame ? "\r\n" : "");
+            if (exchange.fragment_size == 0)
+              writeBytes(connection, bytes);
+            else
+              for (std::size_t offset = 0; offset < bytes.size(); offset += exchange.fragment_size)
+              {
+                writeBytes(connection, bytes.substr(offset, exchange.fragment_size));
+                std::this_thread::sleep_for(1ms);
+              }
+          }
+          if (exchange.close)
+            return;
         }
         while (!stop.stop_requested())
           std::this_thread::sleep_for(1ms);
@@ -60,7 +81,7 @@ public:
 
   uint16_t port() const
   {
-    return listener_.address().port();
+    return listener_.local_endpoint().port();
   }
 
   void finish()
@@ -77,31 +98,44 @@ public:
   }
 
 private:
-  static sockpp::tcp_socket accept(sockpp::tcp_acceptor& listener, std::stop_token stop)
+  static boost::asio::ip::tcp::socket accept(boost::asio::ip::tcp::acceptor& listener, std::stop_token stop)
   {
-    listener.set_non_blocking(true).value();
+    listener.non_blocking(true);
     const auto deadline = std::chrono::steady_clock::now() + 2s;
     while (!stop.stop_requested() && std::chrono::steady_clock::now() < deadline)
     {
-      if (auto result = listener.accept(); result)
+      boost::system::error_code error;
+      auto connection = listener.accept(error);
+      if (!error)
       {
-        auto connection = result.release();
-        connection.read_timeout(2s).value();
+        connection.non_blocking(true);
         return connection;
       }
+      if (error != boost::asio::error::would_block && error != boost::asio::error::try_again)
+        throw boost::system::system_error(error);
       std::this_thread::sleep_for(1ms);
     }
     throw std::runtime_error("Timed out accepting mock RMI connection");
   }
 
-  static std::string readLine(sockpp::tcp_socket& connection)
+  static std::string readLine(boost::asio::ip::tcp::socket& connection)
   {
     std::string line;
     char ch;
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
     while (line.size() < 16384)
     {
-      if (auto result = connection.read(&ch, 1); !result || result.value() != 1)
-        throw std::runtime_error("Unable to read mock RMI request");
+      boost::system::error_code error;
+      const auto size = connection.read_some(boost::asio::buffer(&ch, 1), error);
+      if (error == boost::asio::error::would_block || error == boost::asio::error::try_again)
+      {
+        if (std::chrono::steady_clock::now() >= deadline)
+          throw std::runtime_error("Timed out reading mock RMI request");
+        std::this_thread::sleep_for(1ms);
+        continue;
+      }
+      if (error || size != 1)
+        throw std::runtime_error("Unable to read mock RMI request: " + error.message());
       line += ch;
       if (line.ends_with("\r\n"))
       {
@@ -112,13 +146,16 @@ private:
     throw std::runtime_error("Mock RMI request exceeds limit");
   }
 
-  static void write(sockpp::tcp_socket& connection, const std::string& response)
+  static void writeBytes(boost::asio::ip::tcp::socket& connection, const std::string& bytes)
   {
-    connection.write(response + "\r\n").value();
+    connection.non_blocking(false);
+    boost::asio::write(connection, boost::asio::buffer(bytes));
+    connection.non_blocking(true);
   }
 
-  sockpp::tcp_acceptor listener_;
-  sockpp::tcp_acceptor session_;
+  boost::asio::io_context context_;
+  boost::asio::ip::tcp::acceptor listener_;
+  boost::asio::ip::tcp::acceptor session_;
   std::vector<std::string> requests_;
   std::exception_ptr error_;
   std::jthread worker_;
@@ -237,6 +274,148 @@ TEST(FanucDriver, ControllerErrorsAndTimeoutsAreReported)
   }
   EXPECT_THROW(driver.getStatus(0.01), std::runtime_error);
   ASSERT_NO_THROW(controller.finish());
+}
+
+TEST(FanucDriver, FragmentedAndLargeResponses)
+{
+  const std::string alarm(8192, 'a');
+  Controller controller({
+      { "FRC_Reset", R"({"Command":"FRC_Reset","ErrorID":0})", 0ms, 1 },
+      { "FRC_ReadError", R"({"Command":"FRC_ReadError","ErrorID":0,"ErrorData":")" + alarm + R"("})" },
+  });
+  Fanuc_driver driver("localhost", controller.port());
+  driver.connect();
+  EXPECT_EQ(driver.reset().ErrorID, 0);
+  EXPECT_EQ(driver.readError().ErrorData, alarm);
+  ASSERT_NO_THROW(controller.finish());
+}
+
+TEST(FanucDriver, NewSessionDiscardsHandshakeFragment)
+{
+  Controller controller({ { "FRC_Reset", R"({"Command":"FRC_Reset","ErrorID":0})" } }, R"({"stale":)");
+  Fanuc_driver driver("127.0.0.1", controller.port());
+  EXPECT_EQ(driver.connect().MajorVersion, 3);
+  EXPECT_EQ(driver.reset().ErrorID, 0);
+  ASSERT_NO_THROW(controller.finish());
+}
+
+TEST(FanucDriver, ResponseTimeoutPreservesPendingRead)
+{
+  Controller controller({
+      { "FRC_Reset", R"({"Command":"FRC_Reset","ErrorID":0})", 100ms },
+      { "FRC_Pause", R"({"Command":"FRC_Pause","ErrorID":0})" },
+  });
+  Fanuc_driver driver("127.0.0.1", controller.port());
+  driver.connect();
+  const auto start = std::chrono::steady_clock::now();
+  EXPECT_THROW(driver.reset(0.01), std::runtime_error);
+  EXPECT_LT(std::chrono::steady_clock::now() - start, 80ms);
+  EXPECT_EQ(driver.pause().ErrorID, 0);
+  ASSERT_NO_THROW(controller.finish());
+}
+
+TEST(FanucDriver, UnlimitedAndLargeTimeoutsWaitForData)
+{
+  Controller controller({
+      { "FRC_Reset", R"({"Command":"FRC_Reset","ErrorID":0})", 20ms },
+      { "FRC_Pause", R"({"Command":"FRC_Pause","ErrorID":0})", 20ms },
+  });
+  Fanuc_driver driver("127.0.0.1", controller.port());
+  driver.connect();
+  EXPECT_EQ(driver.reset(-1.0).ErrorID, 0);
+  EXPECT_EQ(driver.pause(std::numeric_limits<double>::max()).ErrorID, 0);
+  ASSERT_NO_THROW(controller.finish());
+}
+
+TEST(FanucDriver, NonFiniteTimeoutsAreReported)
+{
+  Controller controller({
+      { "FRC_Reset", "" },
+      { "FRC_Reset", "" },
+      { "FRC_Reset", "" },
+      { "FRC_Pause", R"({"Command":"FRC_Pause","ErrorID":0})" },
+  });
+  Fanuc_driver driver("127.0.0.1", controller.port());
+  driver.connect();
+  EXPECT_THROW(driver.reset(std::numeric_limits<double>::quiet_NaN()), std::invalid_argument);
+  EXPECT_THROW(driver.reset(std::numeric_limits<double>::infinity()), std::invalid_argument);
+  EXPECT_THROW(driver.reset(-std::numeric_limits<double>::infinity()), std::invalid_argument);
+  EXPECT_EQ(driver.pause().ErrorID, 0);
+  ASSERT_NO_THROW(controller.finish());
+}
+
+TEST(FanucDriver, PushChecksDoNotWaitForData)
+{
+  Controller controller({ { "FRC_Reset", R"({"Command":"FRC_Reset","ErrorID":0})" } });
+  Fanuc_driver driver("127.0.0.1", controller.port());
+  driver.connect();
+  driver.reset();
+  const auto start = std::chrono::steady_clock::now();
+  EXPECT_FALSE(driver.checkSystemFault());
+  EXPECT_FALSE(driver.checkTimeoutTerminate());
+  EXPECT_FALSE(driver.checkCommunicationPacket());
+  EXPECT_FALSE(driver.checkUnknownPacket());
+  EXPECT_FALSE(driver.getLastInstructionResponse());
+  EXPECT_LT(std::chrono::steady_clock::now() - start, 100ms);
+  ASSERT_NO_THROW(controller.finish());
+}
+
+TEST(FanucDriver, CompleteResponseBeforeEofIsDelivered)
+{
+  Controller controller({ { "FRC_Reset", R"({"Command":"FRC_Reset","ErrorID":0})", 0ms, 0, true } });
+  Fanuc_driver driver("127.0.0.1", controller.port());
+  driver.connect();
+  EXPECT_EQ(driver.reset().ErrorID, 0);
+  ASSERT_NO_THROW(controller.finish());
+  EXPECT_THROW(driver.checkSystemFault(), std::runtime_error);
+}
+
+TEST(FanucDriver, EofWithoutCompleteResponseIsReported)
+{
+  Controller controller({ { "FRC_Reset", R"({"Command":)", 0ms, 0, true, false } });
+  Fanuc_driver driver("127.0.0.1", controller.port());
+  driver.connect();
+  try
+  {
+    driver.reset();
+    FAIL() << "An incomplete response followed by EOF must throw";
+  }
+  catch (const std::runtime_error& error)
+  {
+    EXPECT_NE(std::string(error.what()).find("closed by the controller"), std::string::npos);
+  }
+  ASSERT_NO_THROW(controller.finish());
+}
+
+TEST(FanucDriver, RefusedConnectionIsReported)
+{
+  boost::asio::io_context context;
+  boost::asio::ip::tcp::acceptor listener(context, { boost::asio::ip::make_address("127.0.0.1"), 0 });
+  const auto port = listener.local_endpoint().port();
+  listener.close();
+  EXPECT_THROW(Fanuc_driver("127.0.0.1", port), std::runtime_error);
+}
+
+TEST(FanucDriver, ProgramCallMapsTenArgumentsAndRejectsOverflow)
+{
+  Controller controller({
+      { "FRC_Call", R"({"Instruction":"FRC_Call","ErrorID":0,"SequenceID":1})" },
+      { "FRC_Call", R"({"Instruction":"FRC_Call","ErrorID":0,"SequenceID":2})" },
+  });
+  Fanuc_driver driver("127.0.0.1", controller.port());
+  driver.connect();
+  std::vector<rmi::RMICallParam> params;
+  for (int i = 1; i <= 10; ++i)
+    params.emplace_back("Integer", i);
+  EXPECT_EQ(driver.programCall("TEST", 1.0, params).SequenceID, 1);
+  params.emplace_back("Integer", 11);
+  EXPECT_THROW(driver.programCallNonBlocking("TEST", params), std::invalid_argument);
+  EXPECT_EQ(driver.programCall("NO_ARGS").SequenceID, 2);
+  ASSERT_NO_THROW(controller.finish());
+  for (int i = 1; i <= 10; ++i)
+    EXPECT_NE(controller.requests()[0].find("\"ParamValue" + std::to_string(i) + "\":" + std::to_string(i)),
+              std::string::npos);
+  EXPECT_EQ(controller.requests()[1].find("ParamType"), std::string::npos);
 }
 
 TEST(FanucDriver, CoordinatesPositionsAndPayloads)

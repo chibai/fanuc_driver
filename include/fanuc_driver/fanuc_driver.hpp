@@ -208,7 +208,8 @@ private:
   bool processInstructionResponse(std::string& json_response);
   template <typename T>
   std::optional<T> checkForPacketInJSONResponses(std::list<std::string>::iterator& it,
-                                                 std::list<std::string>& json_responses);
+                                                 std::list<std::string>& json_responses,
+                                                 std::optional<int> expected_sequence_id = std::nullopt);
 
   template <typename T>
   void sendRMIPacketNonBlockingImpl(typename T::Request& request_packet);

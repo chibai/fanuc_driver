@@ -12,16 +12,7 @@ option(BUILD_TESTING "Build tests" OFF)
 option(BUILD_EXAMPLES "Build examples" OFF)
 
 include(FetchContent)
-FetchContent_Declare(
-    sockpp
-    GIT_REPOSITORY ${PROJECT_SOURCE_DIR}/third_party/sockpp
-    GIT_TAG afdeacba9448c7a77194eed6ab8e1c0b1653c79a
-    PATCH_COMMAND bash ${PROJECT_SOURCE_DIR}/third_party/apply_patch.bash ${PROJECT_SOURCE_DIR}/third_party/sockpp.patch
-)
-set(SOCKPP_BUILD_SHARED OFF CACHE BOOL "Build sockpp as a shared library")
-set(SOCKPP_BUILD_STATIC ON CACHE BOOL "Build sockpp as a static library")
-FetchContent_MakeAvailable(sockpp)
-set_target_properties(sockpp-static PROPERTIES POSITION_INDEPENDENT_CODE ON)
+find_package(Boost 1.74 REQUIRED)
 
 FetchContent_Declare(
     reflect-cpp
@@ -49,7 +40,7 @@ target_include_directories(fanuc_driver PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
-target_link_libraries(fanuc_driver PRIVATE reflectcpp Sockpp::sockpp Threads::Threads Iconv::Iconv)
+target_link_libraries(fanuc_driver PRIVATE reflectcpp Boost::headers Threads::Threads Iconv::Iconv)
 
 if(BUILD_EXAMPLES)
   add_executable(fanuc_driver_example examples/fanuc_driver_example.cpp)
@@ -69,7 +60,7 @@ if(BUILD_TESTING)
   include(GoogleTest)
   add_executable(fanuc_driver_test tests/serialization_test.cpp tests/fanuc_driver_test.cpp)
   target_include_directories(fanuc_driver_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
-  target_link_libraries(fanuc_driver_test PRIVATE fanuc_driver::fanuc_driver GTest::gtest_main Sockpp::sockpp Threads::Threads)
+  target_link_libraries(fanuc_driver_test PRIVATE fanuc_driver::fanuc_driver GTest::gtest_main Boost::headers Threads::Threads)
   gtest_discover_tests(fanuc_driver_test)
 endif()
 
