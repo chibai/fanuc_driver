@@ -1,7 +1,8 @@
 # fanuc_driver
 
-仅包含 FANUC Remote Motion Interface（RMI）的 C++23 驱动库。
-唯一对外功能入口为 `Fanuc_driver` 类；协议数据类型保留在 `rmi` 命名空间，
+C++23 机械臂驱动库，提供品牌无关的抽象基类 `Robot_driver`，
+目前实现的品牌驱动为 FANUC Remote Motion Interface（RMI）的 `Fanuc_driver`。
+`Fanuc_driver` 公开继承 `Robot_driver`；FANUC 协议数据类型保留在 `rmi` 命名空间，
 不需要创建其他连接对象。
 
 本次为不兼容重构：移除 Stream Motion、GPIO 缓冲和 YAML 配置、Eigen、
@@ -11,6 +12,8 @@
 ## 目录
 
 ```text
+include/robot_driver/
+  robot_driver.hpp      品牌无关的抽象基类和状态类型
 include/fanuc_driver/
   fanuc_driver.hpp      Fanuc_driver 公开接口
   packets.hpp           RMI 请求、响应和运动数据
@@ -83,6 +86,44 @@ IntelliSense 由 CMake Tools 提供真实编译参数，无需手工填写系统
 find_package(fanuc_driver 3 REQUIRED)
 target_link_libraries(my_app PRIVATE fanuc_driver::fanuc_driver)
 ```
+
+### 多品牌统一接口
+
+业务代码依赖 `Robot_driver&` 或 `std::unique_ptr<Robot_driver>`，无需依赖 RMI 数据类型。
+控制方法成功时返回 `void`，失败时抛出异常；状态返回 `RobotStatus`，数字输入返回 `bool`。
+
+```cpp
+#include <fanuc_driver/fanuc_driver.hpp>
+
+void queryRobot(Robot_driver& robot)
+{
+  robot.connect();
+  const RobotStatus status = robot.getStatus();
+  robot.disconnect();
+}
+
+int main()
+{
+  Fanuc_driver fanuc("192.168.1.100");
+  queryRobot(fanuc);
+}
+```
+
+基类统一了连接、断开、运动初始化、暂停、继续、中止、复位、速度倍率、状态、
+数字输入读取和数字输出写入。新增品牌时继承 `Robot_driver` 并实现全部 `do*` 纯虚方法，
+在品牌驱动内负责协议转换和错误检查，业务代码无需修改。
+统一接口的超时以秒计，默认 1 秒，负值无限等待；速度倍率以百分比计。
+状态的 `servo_ready` 表示伺服就绪，`speed_override` 表示速度倍率百分比。
+品牌驱动不支持某操作时应显式抛出异常，不得静默忽略或伪造成功。
+
+基类采用非虚公开入口调用纯虚 `do*` 方法（NVI），以保留 FANUC 原有返回类型：
+通过基类调用获得统一结果，通过 `Fanuc_driver` 调用仍获得原始 `rmi::*Response`。
+FANUC 专用的运动报文、构型、坐标系、寄存器、系统变量等仍仅在派生类提供，
+本次不统一不同品牌的运动单位、构型或队列语义，也未实现其他品牌的通信协议。
+基类具有虚析构函数，禁止复制和移动；析构不发送停止或断开命令。
+新增继承关系改变了 `Fanuc_driver` 的二进制布局，升级时需重新编译下游程序。
+
+### FANUC 原生接口
 
 ```cpp
 #include <fanuc_driver/fanuc_driver.hpp>

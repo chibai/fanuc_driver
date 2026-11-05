@@ -13,12 +13,13 @@ int main(int argc, char* argv[])
 
   try
   {
-    Fanuc_driver driver(argv[1]);
-    const auto connection = driver.connect();
+    Fanuc_driver fanuc(argv[1]);
+    Robot_driver& driver = fanuc;
+    const auto connection = fanuc.connect();
     std::cout << "RMI version: " << connection.MajorVersion << '.' << connection.MinorVersion << '\n';
     const auto status = driver.getStatus();
-    std::cout << "Servo ready: " << status.ServoReady << '\n';
-    const auto joints = driver.readJointAngles();
+    std::cout << "Servo ready: " << status.servo_ready << '\n';
+    const auto joints = fanuc.readJointAngles();
     std::cout << "J1: " << joints.JointAngle.J1 << " degrees\n";
     driver.disconnect();
   }

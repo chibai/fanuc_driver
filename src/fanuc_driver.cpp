@@ -492,6 +492,62 @@ int32_t Fanuc_driver::getSequenceNumber()
   return sequence_number_++;
 }
 
+void Fanuc_driver::doConnect(std::optional<double> timeout)
+{
+  connect(timeout);
+}
+
+void Fanuc_driver::doDisconnect(std::optional<double> timeout)
+{
+  disconnect(timeout);
+}
+
+void Fanuc_driver::doInitializeRemoteMotion(std::optional<double> timeout)
+{
+  initializeRemoteMotion(timeout);
+}
+
+void Fanuc_driver::doPause(std::optional<double> timeout)
+{
+  pause(timeout);
+}
+
+void Fanuc_driver::doResume(std::optional<double> timeout)
+{
+  resume(timeout);
+}
+
+void Fanuc_driver::doAbort(std::optional<double> timeout)
+{
+  abort(timeout);
+}
+
+void Fanuc_driver::doReset(std::optional<double> timeout)
+{
+  reset(timeout);
+}
+
+void Fanuc_driver::doSetSpeedOverride(int value, std::optional<double> timeout)
+{
+  setSpeedOverride(value, timeout);
+}
+
+RobotStatus Fanuc_driver::doGetStatus(std::optional<double> timeout)
+{
+  const auto status = getStatus(timeout);
+  return { status.ServoReady != 0, status.Override };
+}
+
+bool Fanuc_driver::doReadDigitalInputPort(uint16_t port_number, std::optional<double> timeout)
+{
+  return readDigitalInputPort(port_number, timeout).PortValue != 0;
+}
+
+void Fanuc_driver::doWriteDigitalOutputPort(uint16_t port_number, bool port_value, std::optional<double> timeout)
+{
+  writeDigitalOutputPort(port_number, port_value, timeout);
+}
+
 ConnectPacket::Response Fanuc_driver::connect(const std::optional<double> timeout)
 {
   connection_impl_->write(ConnectPacket::Request());
