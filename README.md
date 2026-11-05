@@ -23,7 +23,6 @@ src/
 tests/                  协议单元测试和本地模拟控制器测试
 examples/               仅查询状态的安全示例
 cmake/                  安装包配置
-third_party/            reflect-cpp 及构建补丁
 ```
 
 完整的公开接口、参数和数据类型说明见 [接口文档](docs/API.md)。
@@ -31,14 +30,13 @@ third_party/            reflect-cpp 及构建补丁
 ## 构建
 
 需要支持 C++23（含 `std::expected`）的编译器与标准库，例如 GCC 13+、
-CMake 3.22+、Git 和 Boost 1.74+ 开发头文件。运行环境需有 RMI 功能的控制器。
-网络使用 Boost.Asio，JSON 依赖由 reflect-cpp 子模块提供；不再依赖 sockpp、Eigen 或 YAML。
+CMake 3.22+、Boost 1.74+ 开发头文件及 nlohmann/json 3.11+。运行环境需有 RMI 功能的控制器。
+网络使用 Boost.Asio 和 nlohmann/json；不再依赖 reflect-cpp、sockpp、Eigen 或 YAML。
 C++23 不包含 `std::asio`；本库采用 `boost::asio`，且不在公开头文件中暴露 Boost 类型。
 
 ```bash
 # Ubuntu / Debian
-sudo apt-get install cmake g++ libboost-dev
-git submodule update --init --recursive
+sudo apt-get install cmake g++ libboost-dev nlohmann-json3-dev
 cmake -S . -B build -DBUILD_TESTING=ON -DBUILD_EXAMPLES=ON
 cmake --build build -j2
 ctest --test-dir build --output-on-failure

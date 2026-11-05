@@ -3,41 +3,64 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include "detail/json_adapters.hpp"
 #include "detail/serialization.hpp"
 
 #include "fanuc_driver/packets.hpp"
-#include "rfl/json.hpp"
 
 namespace rmi
 {
 template <typename T>
 std::optional<T> FromJSON(const std::string& json)
 {
-  const auto result = rfl::json::read<T>(json);
-  bool valid_result = false;
-  if constexpr (requires(T t) { t.Command; })
+  try
   {
-    valid_result = result.has_value() && result.value().Command == T().Command;
+    const auto document = nlohmann::json::parse(json);
+    if (!document.is_object())
+    {
+      return std::nullopt;
+    }
+    if (!json_detail::hasRequiredFields<T>(document))
+    {
+      return std::nullopt;
+    }
+    const T result = document.get<T>();
+    bool valid_result = false;
+    if constexpr (requires(T t) { t.Command; })
+    {
+      valid_result = result.Command == T().Command;
+    }
+    if constexpr (requires(T t) { t.Communication; })
+    {
+      valid_result = result.Communication == T().Communication;
+    }
+    if constexpr (requires(T t) { t.Instruction; })
+    {
+      valid_result = result.Instruction == T().Instruction;
+    }
+    return valid_result ? std::optional<T>(result) : std::nullopt;
   }
-  if constexpr (requires(T t) { t.Communication; })
+  catch (const nlohmann::json::exception&)
   {
-    valid_result = result.has_value() && result.value().Communication == T().Communication;
+    return std::nullopt;
   }
-  if constexpr (requires(T t) { t.Instruction; })
-  {
-    valid_result = result.has_value() && result.value().Instruction == T().Instruction;
-  }
-
-  return valid_result ? std::optional<T>(result.value()) : std::nullopt;
 }
 
 std::optional<InstructionResponse> IsInstruction(const std::string& json)
 {
-  const auto result = rfl::json::read<InstructionResponse>(json);
-  bool valid_result = false;
-  valid_result = result.has_value();
-
-  return valid_result ? std::optional<InstructionResponse>(result.value()) : std::nullopt;
+  try
+  {
+    const auto document = nlohmann::json::parse(json);
+    if (!document.is_object() || !json_detail::hasRequiredFields<InstructionResponse>(document))
+    {
+      return std::nullopt;
+    }
+    return document.get<InstructionResponse>();
+  }
+  catch (const nlohmann::json::exception&)
+  {
+    return std::nullopt;
+  }
 }
 
 template std::optional<WriteDigitalOutputPacket::Response>

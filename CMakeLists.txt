@@ -13,17 +13,7 @@ option(BUILD_EXAMPLES "Build examples" OFF)
 
 include(FetchContent)
 find_package(Boost 1.74 REQUIRED)
-
-FetchContent_Declare(
-    reflect-cpp
-    GIT_REPOSITORY ${PROJECT_SOURCE_DIR}/third_party/reflect-cpp
-    GIT_TAG 2a0fdeabe35bdab0e07e05d4f869ca88bd6d2b8c
-    PATCH_COMMAND bash ${PROJECT_SOURCE_DIR}/third_party/apply_patch.bash ${PROJECT_SOURCE_DIR}/third_party/reflectcpp.patch
-)
-set(REFLECTCPP_BUILD_SHARED OFF CACHE BOOL "Build reflectcpp as a shared library")
-set(REFLECTCPP_YAML OFF CACHE BOOL "Enable YAML support" FORCE)
-FetchContent_MakeAvailable(reflect-cpp)
-set_target_properties(reflectcpp PROPERTIES CXX_STANDARD 20 POSITION_INDEPENDENT_CODE ON)
+find_package(nlohmann_json 3.11 REQUIRED)
 
 find_package(Threads REQUIRED)
 find_package(Iconv REQUIRED)
@@ -40,7 +30,7 @@ target_include_directories(fanuc_driver PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
-target_link_libraries(fanuc_driver PRIVATE reflectcpp Boost::headers Threads::Threads Iconv::Iconv)
+target_link_libraries(fanuc_driver PRIVATE nlohmann_json::nlohmann_json Boost::headers Threads::Threads Iconv::Iconv)
 
 if(BUILD_EXAMPLES)
   add_executable(fanuc_driver_example examples/fanuc_driver_example.cpp)
