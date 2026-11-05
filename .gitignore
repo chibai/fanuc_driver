@@ -7,4 +7,10 @@ log
 # Editor specific files
 *.swp
 .idea/
-.vscode/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/c_cpp_properties.json
+!.vscode/cmake-kits.json
+!.vscode/tasks.json
+!.vscode/launch.json

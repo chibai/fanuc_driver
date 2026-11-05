@@ -1,0 +1,86 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "CMake: configure Debug",
+      "type": "process",
+      "command": "cmake",
+      "args": [
+        "-S", "${workspaceFolder}",
+        "-B", "${workspaceFolder}/build/vscode/Debug",
+        "-G", "Ninja",
+        "-DCMAKE_BUILD_TYPE=Debug",
+        "-DCMAKE_CXX_COMPILER=/usr/bin/g++-15",
+        "-DCMAKE_CXX_STANDARD=23",
+        "-DCMAKE_CXX_STANDARD_REQUIRED=ON",
+        "-DCMAKE_CXX_EXTENSIONS=OFF",
+        "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+        "-DBUILD_TESTING=ON",
+        "-DBUILD_EXAMPLES=ON"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "CMake: build Debug",
+      "type": "process",
+      "command": "cmake",
+      "args": [
+        "--build", "${workspaceFolder}/build/vscode/Debug",
+        "--parallel", "2"
+      ],
+      "dependsOn": "CMake: configure Debug",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "CMake: test Debug",
+      "type": "process",
+      "command": "ctest",
+      "args": [
+        "--test-dir", "${workspaceFolder}/build/vscode/Debug",
+        "--output-on-failure",
+        "--no-tests=error"
+      ],
+      "dependsOn": "CMake: build Debug",
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "CMake: configure Release",
+      "type": "process",
+      "command": "cmake",
+      "args": [
+        "-S", "${workspaceFolder}",
+        "-B", "${workspaceFolder}/build/vscode/Release",
+        "-G", "Ninja",
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DCMAKE_CXX_COMPILER=/usr/bin/g++-15",
+        "-DCMAKE_CXX_STANDARD=23",
+        "-DCMAKE_CXX_STANDARD_REQUIRED=ON",
+        "-DCMAKE_CXX_EXTENSIONS=OFF",
+        "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+        "-DBUILD_TESTING=ON",
+        "-DBUILD_EXAMPLES=ON"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "CMake: build Release",
+      "type": "process",
+      "command": "cmake",
+      "args": [
+        "--build", "${workspaceFolder}/build/vscode/Release",
+        "--parallel", "2"
+      ],
+      "dependsOn": "CMake: configure Release",
+      "group": "build",
+      "problemMatcher": ["$gcc"]
+    }
+  ]
+}

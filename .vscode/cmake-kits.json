@@ -1,0 +1,11 @@
+[
+  {
+    "name": "GCC 15",
+    "compilers": {
+      "CXX": "/usr/bin/g++-15"
+    },
+    "preferredGenerator": {
+      "name": "Ninja"
+    }
+  }
+]
