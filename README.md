@@ -43,6 +43,40 @@ ctest --test-dir build --output-on-failure
 cmake --install build --prefix "$PWD/install"
 ```
 
+### VS Code（Ubuntu 26.04 / G++ 15.2 / C++23）
+
+仓库提供完整的 `.vscode/` 配置，使用系统的 `/usr/bin/g++-15`、Ninja 和 GDB。
+先安装依赖，并确认编译器版本为预期的 15.2（配置固定 GCC 主版本，不锁定补丁版本）：
+
+```bash
+sudo apt-get update
+sudo apt-get install g++-15 cmake ninja-build gdb clang-format libboost-dev nlohmann-json3-dev
+/usr/bin/g++-15 --version
+code .
+```
+
+首次打开时安装工作区推荐扩展 **C/C++** 和 **CMake Tools**；
+通过 `CMake: Select a Kit` 选择 **GCC 15**，通过 `CMake: Select Variant` 选择 **Debug**。
+自动配置会启用测试和示例；首次配置测试需要联网下载 GoogleTest。
+
+| 操作 | 入口 |
+|---|---|
+| Debug 构建（自动先配置） | `Ctrl+Shift+B` |
+| 构建并运行本地测试 | `Tasks: Run Task` → `CMake: test Debug` |
+| Release 构建（自动先配置） | `Tasks: Run Task` → `CMake: build Release` |
+| 断点调试本地测试 | 运行和调试中选择 `Debug local tests (GDB)`，按 `F5` |
+| 调试状态查询示例 | 选择 `Debug status-only example (controller connection)`，输入控制器 IP |
+| 单个测试发现与运行 | CMake 配置和构建完成后，在测试资源管理器中运行 |
+
+Debug / Release 产物分别位于 `build/vscode/Debug` 和 `build/vscode/Release`。
+IntelliSense 由 CMake Tools 提供真实编译参数，无需手工填写系统或 Boost 头文件路径；
+保存 C/C++ 文件时使用系统 `clang-format` 和仓库的 `.clang-format`。
+不要同时启用 clangd 的语言服务，以免与 C/C++ 扩展重复诊断。
+
+默认 F5 调试仅使用本地模拟控制器的测试，不连接真实机器人。
+状态查询示例会实际连接输入的控制器，但不发送运动或 I/O 写命令；启动后先停在入口。
+不要将调试器暂停或退出视为机器人安全停止措施。
+
 ## 使用
 
 ```cmake

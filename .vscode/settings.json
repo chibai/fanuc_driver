@@ -1,0 +1,45 @@
+{
+  "cmake.useCMakePresets": "never",
+  "cmake.generator": "Ninja",
+  "cmake.buildDirectory": "${workspaceFolder}/build/vscode/${buildType}",
+  "cmake.configureOnOpen": true,
+  "cmake.configureSettings": {
+    "CMAKE_CXX_COMPILER": "/usr/bin/g++-15",
+    "CMAKE_CXX_STANDARD": "23",
+    "CMAKE_CXX_STANDARD_REQUIRED": true,
+    "CMAKE_CXX_EXTENSIONS": false,
+    "CMAKE_EXPORT_COMPILE_COMMANDS": true,
+    "BUILD_TESTING": true,
+    "BUILD_EXAMPLES": true
+  },
+  "cmake.ctestArgs": [
+    "--output-on-failure",
+    "--no-tests=error"
+  ],
+  "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
+  "C_Cpp.clang_format_style": "file",
+  "C_Cpp.clang_format_fallbackStyle": "none",
+  "C_Cpp.clang_format_path": "/usr/bin/clang-format",
+  "[cpp]": {
+    "editor.defaultFormatter": "ms-vscode.cpptools",
+    "editor.formatOnSave": true,
+    "editor.tabSize": 2,
+    "editor.insertSpaces": true
+  },
+  "[c]": {
+    "editor.defaultFormatter": "ms-vscode.cpptools",
+    "editor.formatOnSave": true,
+    "editor.tabSize": 2,
+    "editor.insertSpaces": true
+  },
+  "files.insertFinalNewline": true,
+  "files.trimTrailingWhitespace": true,
+  "files.watcherExclude": {
+    "**/build/**": true,
+    "**/install/**": true
+  },
+  "search.exclude": {
+    "**/build": true,
+    "**/install": true
+  }
+}

@@ -1,0 +1,53 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug local tests (GDB)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/vscode/Debug/fanuc_driver_test",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "stopAtEntry": false,
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "miDebuggerPath": "/usr/bin/gdb",
+      "setupCommands": [
+        {
+          "description": "Enable GDB pretty-printing",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": false
+        }
+      ],
+      "preLaunchTask": "CMake: build Debug"
+    },
+    {
+      "name": "Debug status-only example (controller connection)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/vscode/Debug/fanuc_driver_example",
+      "args": ["${input:controllerIp}"],
+      "cwd": "${workspaceFolder}",
+      "stopAtEntry": true,
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "miDebuggerPath": "/usr/bin/gdb",
+      "setupCommands": [
+        {
+          "description": "Enable GDB pretty-printing",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": false
+        }
+      ],
+      "preLaunchTask": "CMake: build Debug"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "controllerIp",
+      "type": "promptString",
+      "description": "RMI controller IP (connects to the controller; status queries only)",
+      "default": "127.0.0.1"
+    }
+  ]
+}
