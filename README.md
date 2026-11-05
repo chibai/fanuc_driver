@@ -23,17 +23,21 @@ src/
 tests/                  协议单元测试和本地模拟控制器测试
 examples/               仅查询状态的安全示例
 cmake/                  安装包配置
-third_party/            sockpp、reflect-cpp 及构建补丁
+third_party/            reflect-cpp 及构建补丁
 ```
 
 完整的公开接口、参数和数据类型说明见 [接口文档](docs/API.md)。
 
 ## 构建
 
-需要支持 C++23 的编译器、CMake 3.22+ 和 Git。运行环境需有 RMI 功能的控制器。
-网络和 JSON 依赖由子模块提供；不再依赖 Eigen 或 YAML。
+需要支持 C++23（含 `std::expected`）的编译器与标准库，例如 GCC 13+、
+CMake 3.22+、Git 和 Boost 1.74+ 开发头文件。运行环境需有 RMI 功能的控制器。
+网络使用 Boost.Asio，JSON 依赖由 reflect-cpp 子模块提供；不再依赖 sockpp、Eigen 或 YAML。
+C++23 不包含 `std::asio`；本库采用 `boost::asio`，且不在公开头文件中暴露 Boost 类型。
 
 ```bash
+# Ubuntu / Debian
+sudo apt-get install cmake g++ libboost-dev
 git submodule update --init --recursive
 cmake -S . -B build -DBUILD_TESTING=ON -DBUILD_EXAMPLES=ON
 cmake --build build -j2
@@ -69,8 +73,15 @@ int main()
 
 每个实例独立持有连接和序列号，不可复制或移动。请在单个应用线程中调用同一实例，
 库不提供后台轮询线程或实时流控制。响应值均按值返回，不依赖内部缓存视图。
+内部使用 Asio 异步读写和 `io_context`，在调用线程中驱动完成：
+同步响应等待使用 `steady_clock` 截止时间，不进行忙轮询；`check*` 仅处理当前可用数据。
+组合写操作发送完整 CRLF 帧，接收保留半包并拆分粘包。响应超时不会取消待接收数据，
+后续调用仍可继续收取响应。连接切换会取消旧连接的读取并清除其半包。
+实现使用 RAII、`std::expected` 表达 I/O 完成结果、`std::span` 参数视图、
+C++23 `std::views::zip` 映射程序参数，以及 ranges 投影查找和移动传递响应。
 
 超时参数以秒为单位，省略或 `std::nullopt` 为 1 秒，负数表示无限等待。
+超时必须为有限值；NaN 和无穷大抛出 `std::invalid_argument`。
 网络断开、超时或控制器返回非零 `ErrorID` 时抛出异常，调用者应处理错误。
 `check*` 无对应推送包时返回 `std::nullopt`，不代表通信失败。
 扩展命令是否可用取决于控制器版本与选项，尤其是变量写入。
@@ -115,6 +126,7 @@ int main()
 | 队列内切换用户坐标系、工具坐标系、负载表 | `SetUFramePacket`、`SetToolFramePacket`、`SetPayloadInstructionPacket` |
 
 同步调用等待对应序列号的响应；异步调用只发送并分配序列号，不等待执行完成。
+程序调用超过 10 个参数时在发送前抛出 `std::invalid_argument`，不再静默丢弃多余参数。
 通过 `getLastInstructionResponse()` 主动接收并检查最新响应的 `SequenceID` 与 `ErrorID`。
 `getRemainingBufferSize()` 按 8 条指令窗口计算，不会自动限流或阻止发送；
 初始化会重置序列号。关节角采用控制器原生的度，位置采用毫米，
