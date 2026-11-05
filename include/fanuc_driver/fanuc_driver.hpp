@@ -16,13 +16,14 @@
 
 #include "fanuc_driver/packets.hpp"
 #include "fanuc_driver/types.hpp"
+#include "robot_driver/robot_driver.hpp"
 
-class Fanuc_driver final
+class Fanuc_driver final : public Robot_driver
 {
 public:
   explicit Fanuc_driver(const std::string& robot_ip_address, uint16_t rmi_port = 16001);
 
-  ~Fanuc_driver();
+  ~Fanuc_driver() override;
 
   Fanuc_driver(const Fanuc_driver&) = delete;
 
@@ -193,6 +194,18 @@ public:
   typename T::Response sendRMIPacket(typename T::Request& request_packet, std::optional<double> timeout = std::nullopt);
 
 private:
+  void doConnect(std::optional<double> timeout) override;
+  void doDisconnect(std::optional<double> timeout) override;
+  void doInitializeRemoteMotion(std::optional<double> timeout) override;
+  void doPause(std::optional<double> timeout) override;
+  void doResume(std::optional<double> timeout) override;
+  void doAbort(std::optional<double> timeout) override;
+  void doReset(std::optional<double> timeout) override;
+  void doSetSpeedOverride(int value, std::optional<double> timeout) override;
+  RobotStatus doGetStatus(std::optional<double> timeout) override;
+  bool doReadDigitalInputPort(uint16_t port_number, std::optional<double> timeout) override;
+  void doWriteDigitalOutputPort(uint16_t port_number, bool port_value, std::optional<double> timeout) override;
+
   struct PConnectionImpl;
 
   int32_t getSequenceNumber();

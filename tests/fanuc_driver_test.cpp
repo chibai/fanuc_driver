@@ -163,7 +163,67 @@ private:
 
 static_assert(!std::is_copy_constructible_v<Fanuc_driver>);
 static_assert(!std::is_move_constructible_v<Fanuc_driver>);
+static_assert(std::is_base_of_v<Robot_driver, Fanuc_driver>);
+static_assert(!std::is_abstract_v<Fanuc_driver>);
 }  // namespace
+
+TEST(FanucDriver, BrandIndependentInterface)
+{
+  Controller controller({
+      { "FRC_Initialize", R"({"Command":"FRC_Initialize","ErrorID":0})" },
+      { "FRC_GetStatus",
+        R"({"Command":"FRC_GetStatus","ErrorID":0,"ServoReady":1,"TPMode":0,"RMIMotionStatus":1,"ProgramStatus":0,"SingleStepMode":0,"NumberUTool":10,"NextSequenceID":1,"NumberUFrame":9,"Override":20})" },
+      { "FRC_SetOverRide", R"({"Command":"FRC_SetOverRide","ErrorID":0})" },
+      { "FRC_ReadDIN", R"({"Command":"FRC_ReadDIN","ErrorID":0,"PortNumber":7,"PortValue":1})" },
+      { "FRC_ReadDIN", R"({"Command":"FRC_ReadDIN","ErrorID":0,"PortNumber":8,"PortValue":0})" },
+      { "FRC_WriteDOUT", R"({"Command":"FRC_WriteDOUT","ErrorID":0})" },
+      { "FRC_WriteDOUT", R"({"Command":"FRC_WriteDOUT","ErrorID":0})" },
+      { "FRC_Pause", R"({"Command":"FRC_Pause","ErrorID":0})" },
+      { "FRC_Continue", R"({"Command":"FRC_Continue","ErrorID":0})" },
+      { "FRC_Abort", R"({"Command":"FRC_Abort","ErrorID":0})" },
+      { "FRC_Reset", R"({"Command":"FRC_Reset","ErrorID":0})" },
+      { "FRC_Disconnect", R"({"Communication":"FRC_Disconnect","ErrorID":0})" },
+  });
+  std::unique_ptr<Robot_driver> driver = std::make_unique<Fanuc_driver>("127.0.0.1", controller.port());
+  driver->connect();
+  driver->initializeRemoteMotion();
+  const auto status = driver->getStatus();
+  EXPECT_TRUE(status.servo_ready);
+  EXPECT_EQ(status.speed_override, 20);
+  driver->setSpeedOverride(35);
+  EXPECT_TRUE(driver->readDigitalInputPort(7));
+  EXPECT_FALSE(driver->readDigitalInputPort(8));
+  driver->writeDigitalOutputPort(9, true);
+  driver->writeDigitalOutputPort(10, false);
+  driver->pause();
+  driver->resume();
+  driver->abort();
+  driver->reset();
+  driver->disconnect();
+  driver.reset();
+  ASSERT_NO_THROW(controller.finish());
+  EXPECT_NE(controller.requests()[2].find(R"("Value":35)"), std::string::npos);
+  EXPECT_NE(controller.requests()[3].find(R"("PortNumber":7)"), std::string::npos);
+  EXPECT_NE(controller.requests()[4].find(R"("PortNumber":8)"), std::string::npos);
+  EXPECT_NE(controller.requests()[5].find(R"("PortNumber":9)"), std::string::npos);
+  EXPECT_NE(controller.requests()[5].find(R"("PortValue":"ON")"), std::string::npos);
+  EXPECT_NE(controller.requests()[6].find(R"("PortNumber":10)"), std::string::npos);
+  EXPECT_NE(controller.requests()[6].find(R"("PortValue":"OFF")"), std::string::npos);
+}
+
+TEST(FanucDriver, BrandIndependentInterfacePropagatesErrors)
+{
+  Controller controller({
+      { "FRC_Pause", R"({"Command":"FRC_Pause","ErrorID":2556938})" },
+      { "FRC_GetStatus", "", 0ms, 0, true },
+  });
+  Fanuc_driver fanuc("127.0.0.1", controller.port());
+  Robot_driver& driver = fanuc;
+  driver.connect();
+  EXPECT_THROW(driver.pause(), std::runtime_error);
+  EXPECT_THROW(driver.getStatus(), std::runtime_error);
+  ASSERT_NO_THROW(controller.finish());
+}
 
 TEST(FanucDriver, StandardRmiSessionAndControl)
 {

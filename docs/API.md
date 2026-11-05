@@ -1,6 +1,7 @@
 # FANUC RMI C++ 接口参考
 
-本文档对应 `fanuc_driver` 3.x 的公开 C++23 API，依据 `include/fanuc_driver/` 中的头文件编写。唯一的连接与命令入口是全局作用域的 `Fanuc_driver` 类；RMI 请求、响应和运动数据结构位于 `rmi` 命名空间。
+本文档对应 `fanuc_driver` 3.x 的公开 C++23 API。品牌无关的抽象基类为全局作用域的
+`Robot_driver`，FANUC 实现为公开继承它的 `Fanuc_driver`；RMI 请求、响应和运动数据结构位于 `rmi` 命名空间。
 
 ```cpp
 #include <fanuc_driver/fanuc_driver.hpp>
@@ -18,6 +19,41 @@ target_link_libraries(my_app PRIVATE fanuc_driver::fanuc_driver)
 项目要求支持 `std::expected` 的 C++23 编译器与标准库，构建时需要 Boost 1.74+
 开发头文件。TCP 使用 `boost::asio`（C++23 尚无 `std::asio`），Boost 是私有实现依赖，
 安装包使用者不需要在公开 API 中包含或链接 Boost。构建示例和测试的项目命令见仓库根目录的 README。
+
+### 品牌无关的抽象基类
+
+仅包含 `<robot_driver/robot_driver.hpp>` 即可编写不依赖 FANUC/RMI 的业务代码或新的品牌实现。
+该头文件仅依赖标准库，随现有 CMake 安装包一起安装。
+
+| `Robot_driver` 方法 | 统一返回值 / 含义 |
+|---|---|
+| `connect(timeout)` / `disconnect(timeout)` | `void`；建立 / 结束品牌协议会话 |
+| `initializeRemoteMotion(timeout)` | `void`；显式初始化远程运动，不隐式发送运动 |
+| `pause(timeout)` / `resume(timeout)` | `void`；暂停 / 继续远程程序 |
+| `abort(timeout)` / `reset(timeout)` | `void`；中止远程程序 / 请求控制器复位 |
+| `setSpeedOverride(int value, timeout)` | `void`；设置速度倍率百分比 |
+| `getStatus(timeout)` | `RobotStatus{bool servo_ready, int speed_override}`；伺服就绪和速度倍率百分比 |
+| `readDigitalInputPort(uint16_t port_number, timeout)` | `bool`；数字输入 OFF / ON |
+| `writeDigitalOutputPort(uint16_t port_number, bool port_value, timeout)` | `void`；写数字输出 OFF / ON |
+
+所有超时参数类型为 `std::optional<double>`，默认为 `std::nullopt`，遵循下文秒数规则。
+所有品牌实现必须检查原生响应并以异常报告失败；不支持的操作同样必须显式抛出异常。
+端口编号和有效速度倍率范围由品牌控制器定义。基类不持有连接，不提供后台线程，
+也不自动调用初始化、停止或断开。具体驱动的构造连接行为仍由该驱动决定；
+FANUC 构造函数依旧立即建立初始 TCP 连接。
+
+基类采用 NVI：公开非虚方法转发到对应的 `doConnect`、`doDisconnect`、
+`doInitializeRemoteMotion`、`doPause`、`doResume`、`doAbort`、`doReset`、
+`doSetSpeedOverride`、`doGetStatus`、`doReadDigitalInputPort`、
+`doWriteDigitalOutputPort` 纯虚方法。新增品牌必须实现这些方法，无需引用 `rmi`。
+基类不可复制或移动，具有公开虚析构函数，可用 `std::unique_ptr<Robot_driver>` 持有派生类。
+
+`Fanuc_driver` 的适配方法复用原有 RMI 实现，保留其超时、错误检查和序列号行为。
+状态映射为 `ServoReady != 0` 和 `Override`，数字输入映射为 `PortValue != 0`。
+通过 `Robot_driver&` / 指针调用取得统一返回值；通过 `Fanuc_driver` 调用仍返回原有
+`rmi::*Response`，不会丢失协议字段。FANUC 专用的运动、构型、坐标系、寄存器、
+变量、队列及推送接口不进入基类。现有源码调用方式不变，但继承关系改变二进制布局，
+下游程序必须重新编译。
 
 ## 2. 连接和典型调用顺序
 
