@@ -18,10 +18,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
       - run: git config --global --add safe.directory '*'
-      - run: sudo apt-get update && sudo apt-get install -y cmake g++ libboost-dev
+      - run: sudo apt-get update && sudo apt-get install -y cmake g++ libboost-dev nlohmann-json3-dev
       - run: cmake -B build -S . -DBUILD_TESTING=ON -DBUILD_EXAMPLES=ON
       - run: cmake --build build -j
       - run: ctest --test-dir build --output-on-failure

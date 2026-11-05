@@ -13,9 +13,7 @@
 
 namespace rmi
 {
-// Note: The struct names in this file use capitalized names to match the JSON packet keys exactly.
-// This is required for correct serialization/deserialization with the cpp-reflect library.
-// The struct naming cannot be changed to another style for this reason.
+// Field names match the JSON packet keys and are mapped by the nlohmann/json adapters.
 // The packet definitions are from Remote Motion Interface OPERATOR'S MANUAL B-84184EN/03.
 
 struct FrameData

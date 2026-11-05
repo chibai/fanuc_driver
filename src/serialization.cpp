@@ -4,9 +4,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "detail/serialization.hpp"
+#include "detail/json_adapters.hpp"
 
 #include "fanuc_driver/packets.hpp"
-#include "rfl/json.hpp"
 
 namespace rmi
 {
@@ -14,7 +14,19 @@ namespace rmi
 template <typename T>
 std::string ToJSON(const T& data)
 {
-  return rfl::json::write(data);
+  nlohmann::json json = data;
+  for (auto it = json.begin(); it != json.end();)
+  {
+    if (it->is_null())
+    {
+      it = json.erase(it);
+    }
+    else
+    {
+      ++it;
+    }
+  }
+  return json.dump();
 }
 
 template std::string ToJSON<ConnectPacket::Request>(const ConnectPacket::Request&);

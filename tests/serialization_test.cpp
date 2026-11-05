@@ -17,6 +17,13 @@ TEST(ToJSON, ConnectPacket)
   EXPECT_EQ(connect_packet_json, expected_connect_packet_json);
 }
 
+TEST(ToJSON, OmitsUnsetOptionalFields)
+{
+  const rmi::InitializePacket::Request initialize_packet;
+
+  EXPECT_EQ(rmi::ToJSON(initialize_packet), R"({"Command":"FRC_Initialize"})");
+}
+
 TEST(FromJSON, ConnectPacketResponse)
 {
   rmi::ConnectPacket::Response expected_connect_packet_response{};
@@ -34,6 +41,13 @@ TEST(FromJSON, ConnectPacketResponse)
   EXPECT_EQ(expected_connect_packet_response.MajorVersion, connect_packet_response.value().MajorVersion);
   EXPECT_EQ(expected_connect_packet_response.MinorVersion, connect_packet_response.value().MinorVersion);
   EXPECT_EQ(expected_connect_packet_response.PortNumber, connect_packet_response.value().PortNumber);
+}
+
+TEST(FromJSON, RejectsInvalidAndNonInstructionPackets)
+{
+  EXPECT_FALSE(rmi::FromJSON<rmi::ConnectPacket::Response>("not json"));
+  EXPECT_FALSE(rmi::FromJSON<rmi::ConnectPacket::Response>(R"({"Communication":"FRC_Connect"})"));
+  EXPECT_FALSE(rmi::IsInstruction(R"({"Command":"FRC_Reset","ErrorID":0})"));
 }
 
 TEST(RmiLineBuffer, PreservesPartialFramesAcrossAppends)
