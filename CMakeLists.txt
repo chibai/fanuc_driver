@@ -19,9 +19,10 @@ find_package(Threads REQUIRED)
 find_package(Iconv REQUIRED)
 
 add_library(fanuc_driver SHARED
-    src/fanuc_driver.cpp
-    src/serialization.cpp
-    src/deserialization.cpp
+    src/core/error.cpp
+    src/drivers/fanuc/robot.cpp
+    src/drivers/fanuc/serialization.cpp
+    src/drivers/fanuc/deserialization.cpp
 )
 add_library(fanuc_driver::fanuc_driver ALIAS fanuc_driver)
 target_compile_features(fanuc_driver PUBLIC cxx_std_23)
@@ -33,8 +34,7 @@ target_include_directories(fanuc_driver PUBLIC
 target_link_libraries(fanuc_driver PRIVATE nlohmann_json::nlohmann_json Boost::headers Threads::Threads Iconv::Iconv)
 
 if(BUILD_EXAMPLES)
-  add_executable(fanuc_driver_example examples/fanuc_driver_example.cpp)
-  target_link_libraries(fanuc_driver_example PRIVATE fanuc_driver::fanuc_driver)
+  add_subdirectory(examples)
 endif()
 
 if(BUILD_TESTING)
@@ -47,11 +47,7 @@ if(BUILD_TESTING)
   set(BUILD_GMOCK OFF CACHE BOOL "Build Google Mock" FORCE)
   FetchContent_MakeAvailable(googletest)
   enable_testing()
-  include(GoogleTest)
-  add_executable(fanuc_driver_test tests/serialization_test.cpp tests/fanuc_driver_test.cpp tests/robot_driver_test.cpp)
-  target_include_directories(fanuc_driver_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
-  target_link_libraries(fanuc_driver_test PRIVATE fanuc_driver::fanuc_driver GTest::gtest_main Boost::headers Threads::Threads)
-  gtest_discover_tests(fanuc_driver_test)
+  add_subdirectory(tests)
 endif()
 
 include(CMakePackageConfigHelpers)

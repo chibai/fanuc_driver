@@ -6,7 +6,7 @@
 #include "detail/json_adapters.hpp"
 #include "detail/serialization.hpp"
 
-#include "fanuc_driver/packets.hpp"
+#include "robot_driver/drivers/fanuc/packets.hpp"
 
 namespace rmi
 {
@@ -20,25 +20,46 @@ std::optional<T> FromJSON(const std::string& json)
     {
       return std::nullopt;
     }
-    if (!json_detail::hasRequiredFields<T>(document))
-    {
-      return std::nullopt;
-    }
-    const T result = document.get<T>();
+    T result{};
     bool valid_result = false;
     if constexpr (requires(T t) { t.Command; })
     {
-      valid_result = result.Command == T().Command;
+      valid_result = document.at("Command").get<std::string>() == result.Command;
     }
     if constexpr (requires(T t) { t.Communication; })
     {
-      valid_result = result.Communication == T().Communication;
+      valid_result = document.at("Communication").get<std::string>() == result.Communication;
     }
     if constexpr (requires(T t) { t.Instruction; })
     {
-      valid_result = result.Instruction == T().Instruction;
+      valid_result = document.at("Instruction").get<std::string>() == result.Instruction;
     }
-    return valid_result ? std::optional<T>(result) : std::nullopt;
+    if (!valid_result)
+      return std::nullopt;
+
+    if constexpr (requires(T t) { t.ErrorID; })
+    {
+      result.ErrorID = document.at("ErrorID").get<int>();
+      if (result.ErrorID != 0)
+      {
+        // Error replies may omit success-only data, but instruction correlation is still required.
+        if constexpr (requires(T t) { t.SequenceID; })
+        {
+          if constexpr (requires { result.SequenceID.has_value(); })
+          {
+            if (document.contains("SequenceID"))
+              document.at("SequenceID").get_to(result.SequenceID);
+          }
+          else
+            result.SequenceID = document.at("SequenceID").get<int>();
+        }
+        return result;
+      }
+    }
+
+    if (!json_detail::hasRequiredFields<T>(document))
+      return std::nullopt;
+    return document.get<T>();
   }
   catch (const nlohmann::json::exception&)
   {
