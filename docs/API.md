@@ -4,7 +4,7 @@
 `Robot_driver`，FANUC 实现为公开继承它的 `Fanuc_driver`；RMI 请求、响应和运动数据结构位于 `rmi` 命名空间。
 
 ```cpp
-#include <fanuc_driver/fanuc_driver.hpp>
+#include <robot_driver/drivers/fanuc/robot.hpp>
 ```
 
 ## 1. 编译和链接
@@ -22,22 +22,25 @@ target_link_libraries(my_app PRIVATE fanuc_driver::fanuc_driver)
 
 ### 品牌无关的抽象基类
 
-仅包含 `<robot_driver/robot_driver.hpp>` 即可编写不依赖 FANUC/RMI 的业务代码或新的品牌实现。
+仅包含 `<robot_driver/core/robot.hpp>` 即可编写不依赖 FANUC/RMI 的业务代码或新的品牌实现。
 该头文件仅依赖标准库，随现有 CMake 安装包一起安装。
+`<robot_driver/robot_driver.hpp>` 是包含契约层和现有 FANUC 驱动的聚合入口；
+公共基础类型在 `<robot_driver/core/types.hpp>`，错误和响应在 `<robot_driver/core/error.hpp>`。
+类名、命名空间和 CMake 包名未改变，目录依赖规则见 [架构说明](architecture.md)。
 
 | `Robot_driver` 方法 | 统一返回值 / 含义 |
 |---|---|
-| `connect(timeout)` / `disconnect(timeout)` | `void`；建立 / 结束品牌协议会话 |
-| `initializeRemoteMotion(timeout)` | `void`；显式初始化远程运动，不隐式发送运动 |
-| `pause(timeout)` / `resume(timeout)` | `void`；暂停 / 继续远程程序 |
-| `abort(timeout)` / `reset(timeout)` | `void`；中止远程程序 / 请求控制器复位 |
-| `setSpeedOverride(int value, timeout)` | `void`；设置速度倍率百分比 |
-| `getStatus(timeout)` | `RobotStatus{bool servo_ready, int speed_override}`；伺服就绪和速度倍率百分比 |
-| `readDigitalInputPort(uint16_t port_number, timeout)` | `bool`；数字输入 OFF / ON |
-| `writeDigitalOutputPort(uint16_t port_number, bool port_value, timeout)` | `void`；写数字输出 OFF / ON |
+| `connect(timeout)` / `disconnect(timeout)` | `ResponseStatus`；建立 / 结束品牌协议会话 |
+| `initializeRemoteMotion(timeout)` | `ResponseStatus`；显式初始化远程运动，不隐式发送运动 |
+| `pause(timeout)` / `resume(timeout)` | `ResponseStatus`；暂停 / 继续远程程序 |
+| `abort(timeout)` / `reset(timeout)` | `ResponseStatus`；中止远程程序 / 请求控制器复位 |
+| `setSpeedOverride(int value, timeout)` | `ResponseStatus`；设置速度倍率百分比 |
+| `getStatus(timeout)` | `Response<RobotStatus>`；数据为伺服就绪和速度倍率百分比 |
+| `readDigitalInputPort(uint16_t port_number, timeout)` | `std::expected<bool, ResponseStatus>`；数据为数字输入 OFF / ON |
+| `writeDigitalOutputPort(uint16_t port_number, bool port_value, timeout)` | `ResponseStatus`；写数字输出 OFF / ON |
 
 所有超时参数类型为 `std::optional<double>`，默认为 `std::nullopt`，遵循下文秒数规则。
-所有品牌实现必须检查原生响应并以异常报告失败；不支持的操作同样必须显式抛出异常。
+所有品牌实现必须检查原生响应并返回失败状态；不支持的操作返回 `INTERFACE_NOTIMPLEMENTED`。
 端口编号和有效速度倍率范围由品牌控制器定义。基类不持有连接，不提供后台线程，
 也不自动调用初始化、停止或断开。具体驱动的构造连接行为仍由该驱动决定；
 FANUC 构造函数依旧立即建立初始 TCP 连接。
@@ -50,10 +53,15 @@ FANUC 构造函数依旧立即建立初始 TCP 连接。
 
 `Fanuc_driver` 的适配方法复用原有 RMI 实现，保留其超时、错误检查和序列号行为。
 状态映射为 `ServoReady != 0` 和 `Override`，数字输入映射为 `PortValue != 0`。
-通过 `Robot_driver&` / 指针调用取得统一返回值；通过 `Fanuc_driver` 调用仍返回原有
-`rmi::*Response`，不会丢失协议字段。FANUC 专用的运动、构型、坐标系、寄存器、
-变量、队列及推送接口不进入基类。现有源码调用方式不变，但继承关系改变二进制布局，
-下游程序必须重新编译。
+通过 `Robot_driver&` / 指针调用取得品牌无关的返回值；通过 `Fanuc_driver` 同步调用返回
+`Response<rmi::*Packet::Response>`（I/O 和寄存器读取除外），成功时 `data` 保留全部原始协议字段。
+数字输入、通用 I/O、数值寄存器和位置寄存器读取返回
+`std::expected<rmi::*Packet::Response, ResponseStatus>`，通过 `value()` 或 `->` 访问完整协议数据，
+失败时通过 `error()` 获取通用状态。基类数字输入读取成功数据为 `bool`。
+FANUC 专用的运动、构型、坐标系、寄存器、变量、队列及推送接口不进入基类。
+本次返回类型及错误处理方式不兼容旧接口；下游使用 `Response<T>` 时检查 `ok()` 并访问 `data`，
+使用 `std::expected` 时检查 `has_value()` 并访问值或错误，不再依赖捕获异常判断同步操作失败，
+并重新编译。
 
 ## 2. 连接和典型调用顺序
 
@@ -63,7 +71,7 @@ FANUC 构造函数依旧立即建立初始 TCP 连接。
 #include <exception>
 #include <iostream>
 
-#include <fanuc_driver/fanuc_driver.hpp>
+#include <robot_driver/drivers/fanuc/robot.hpp>
 
 int main()
 {
@@ -71,15 +79,35 @@ int main()
   {
     Fanuc_driver driver("192.168.1.100");  // 默认端口 16001
     const auto connection = driver.connect();
-    std::cout << "RMI " << connection.MajorVersion << '.'
-              << connection.MinorVersion << '\n';
+    if (!connection.ok())
+    {
+      std::cerr << connection.status.message() << ": " << connection.status.detail << '\n';
+      return 1;
+    }
+    std::cout << "RMI " << connection.data->MajorVersion << '.'
+              << connection.data->MinorVersion << '\n';
 
     const auto status = driver.getStatus();
+    if (!status.ok())
+    {
+      std::cerr << status.status.message() << ": " << status.status.detail << '\n';
+      return 1;
+    }
     const auto joints = driver.readJointAngles();
-    std::cout << "ServoReady=" << static_cast<int>(status.ServoReady)
-              << ", J1=" << joints.JointAngle.J1 << " deg\n";
+    if (!joints.ok())
+    {
+      std::cerr << joints.status.message() << ": " << joints.status.detail << '\n';
+      return 1;
+    }
+    std::cout << "ServoReady=" << static_cast<int>(status.data->ServoReady)
+              << ", J1=" << joints.data->JointAngle.J1 << " deg\n";
 
-    driver.disconnect();
+    const auto disconnected = driver.disconnect();
+    if (!disconnected.ok())
+    {
+      std::cerr << disconnected.status.message() << ": " << disconnected.status.detail << '\n';
+      return 1;
+    }
   }
   catch (const std::exception& e)
   {
@@ -89,7 +117,7 @@ int main()
 }
 ```
 
-`connect()` 返回 `rmi::ConnectPacket::Response`，其中包括协商到的 `PortNumber` 和控制器 RMI `MajorVersion` / `MinorVersion`。成功后可进行状态、读写或运动调用。`disconnect()` 结束 RMI 会话；析构函数只释放 TCP 资源，不发送停止、复位或断开命令。不要依赖析构函数作为机器人停止机制。
+`connect()` 返回 `Response<rmi::ConnectPacket::Response>`，成功数据包括协商到的 `PortNumber` 和控制器 RMI `MajorVersion` / `MinorVersion`。成功后可进行状态、读写或运动调用。`disconnect()` 结束 RMI 会话；析构函数只释放 TCP 资源，不发送停止、复位或断开命令。不要依赖析构函数作为机器人停止机制。
 
 一个 `Fanuc_driver` 对象不可复制或移动，内部连接和指令序号由对象独立持有。虽然实现内部对部分共享状态加锁，同一实例仍建议只由一个应用线程调用；该库不提供轮询线程、运动控制循环或实时流接口。
 Asio 异步操作在调用线程中由 `io_context` 驱动；同步接口等待网络事件而非忙轮询。
@@ -98,30 +126,78 @@ Asio 异步操作在调用线程中由 `io_context` 驱动；同步接口等待�
 
 ## 3. 通用约定
 
+### 通用响应
+
+`<robot_driver/core/error.hpp>` 定义品牌无关的 `ResponseCode`、`ResponseStatus`、
+`Response<T>`，不依赖 FANUC、Boost 或 JSON。
+
+| 成员 | 含义 |
+|---|---|
+| `status.value` / `status.code()` | 稳定枚举 / 数值状态码；`OK` 为 0 |
+| `status.ok()` | 状态码是否成功 |
+| `status.message(language = {})` | 用户消息；省略语言时每次读取 `ROBOTDRIVERCORE_LANGUAGE` |
+| `status.detail` | 原始诊断详情，不做翻译，不用于判断错误类别 |
+| `status.controller_error` | 可选的 FANUC 原始 `ErrorID`；与通用状态码分开保存 |
+| `response.status` | `Response<T>` 的通用状态 |
+| `response.data` | `std::optional<T>`；操作成功有数据，失败为空 |
+| `response.ok()` | 状态成功且数据存在；使用数据前必须检查 |
+
+消息支持 `zh`、`en`、`de`，未配置或不支持的语言回退中文。可使用 `message("en")`
+显式选择语言。翻译直接编译进库，不依赖运行目录、CSV 文件或动态枚举扩展。
+未知控制器错误使用 `CONTROLLER_ERROR`，原始码和未知码说明仍会保留。
+不要通过字符串匹配诊断详情推断错误码。
+
+| FANUC 同步操作结果 | 通用状态码 |
+|---|---|
+| 成功 | `OK`（0） |
+| TCP 连接切换或读写失败 | `CONNECTION_ERROR`（1120） |
+| 非有限响应超时、程序调用超过 10 个参数 | `INVALID_PARAMETER`（1160） |
+| 本地寄存器编号越界 | `INDEX_OUT_OF_RANGE`（1901） |
+| 控制器非零 `ErrorID` | `CONTROLLER_ERROR`（3000） |
+| 等待响应超时 | `WAITING_TIMEOUT`（4411） |
+| 编码转换器创建失败 | `SERVER_ERR`（9998） |
+
+基类控制方法只返回 `ResponseStatus`；FANUC 的 `readDigitalInputPort()`、`readIOPort()`、
+`readNumericRegister()`、`readPositionRegister()` 返回
+`std::expected<原响应类型, ResponseStatus>`；其余同步方法，包括 `sendRMIPacket<T>()`，
+仍返回 `Response<原响应类型>`，不丢失版本、序号、位置或 I/O 数据。
+`Robot_driver::readDigitalInputPort()` 返回 `std::expected<bool, ResponseStatus>`。
+`expected.has_value()` 或布尔转换判断操作成功；成功时使用 `value()`、`*`、`->`，
+失败时使用 `error().code()`、`error().message()`、`error().detail`、`error().controller_error`。
+成功读取到 `false` 或 `0` 仍然有值，不是失败；`std::expected` 不存在“成功但缺少数据”的状态。
+这四类读取接口不再使用 `.data` / `.status`，其他接口的调用方式不变。
+构造函数无法返回状态，仍可能因初始 TCP 建连失败抛出异常。
+异步发送、推送检查、`getLastInstructionResponse()`、`getRemainingBufferSize()` 的返回值和
+异常语义保持不变；异步发送成功不等于控制器执行成功。
+程序逻辑错误和资源分配异常不会被捕获为普通操作失败。
+
 ### 超时与错误
 
 - 具有 `timeout` 参数的方法以**秒**计时；省略参数或传入 `std::nullopt` 时等待 1 秒。
 - 传入负值表示不设响应等待期限。超时只控制等待响应，不会取消已经发送给控制器的命令。
-- 超时必须是有限值；NaN 和无穷大抛出 `std::invalid_argument`。超时后保留待接收数据，
+- 超时必须是有限值；NaN 和无穷大返回 `INVALID_PARAMETER`。超时后保留待接收数据，
   后续调用可继续收取响应。超时不限制 DNS 解析、TCP 建连或发送所花的时间。
-- TCP 连接/读写失败、响应超时以及控制器响应中的非零 `ErrorID` 会以异常报告，通常为 `std::runtime_error`。写调用方应在应用边界捕获异常并决定如何处理。
-- `getErrorMessageString(code)` 将已知 RMI 错误码转换为文本；未知值返回带错误码的说明。控制器产生的报警文本由 `readError()` 获取，与接口抛出的 `ErrorID` 异常不同。
+- 同步操作的 TCP 连接/读写失败、响应超时和非零 `ErrorID` 通过上述状态报告，调用方必须检查结果。
+- `getErrorMessageString(code)` 将已知 RMI 错误码转换为文本；未知值返回带错误码的说明。控制器产生的报警文本由 `readError()` 获取，与响应状态中的 `controller_error` 不同。
 - `readError(timeout, count)` 的 `count` 是可选的，协议响应中的有效范围为 1–5；具体控制器版本也可能限制可读报警数。
 
 ### 数值和可选参数
 
-- 位置寄存器编号在本库中检查为 1–100；数值寄存器编号检查为 1–200。超出范围会在发送前抛出异常。
+- 位置寄存器编号在本库中检查为 1–100；数值寄存器编号检查为 1–200。超出范围会在发送前返回 `INDEX_OUT_OF_RANGE`。
 - `group`、`groupmask` 和可选运动字段用 `std::optional` 表示；省略时不在请求中写入该字段，并非设为数值零。
-- 返回值是按值解析得到的 RMI 响应结构。状态字段通常保留控制器定义的整数/字节值，库不将它们转换为枚举。
+- 成功响应的 `data` 是按值解析得到的 RMI 结构。协议状态字段保留控制器定义的整数/字节值，不等同于通用 `ResponseCode`。
 - `std::variant<int, float>` 表示整数或浮点数。数字寄存器、通用 I/O 和系统变量的写接口只接受这两种数值类型，不接受字符串。
 
 ## 4. 功能接口索引
 
 以下方法均为 `Fanuc_driver` 的公开成员。除特别注明外，可选 `timeout` 参数均遵循上述秒数规则。
+同步方法默认返回 `Response<T>`；下表的协议响应类型和字段默认指成功时的 `data`，
+访问前须检查 `ok()`。四类 I/O / 寄存器读取使用上述 `std::expected`，
+须检查 `has_value()` 再访问数据。异步发送、推送和辅助方法保留各自的返回类型。
 
 ### 会话、初始化和控制
 
-| 方法 | 用途 / 关键参数 | 返回值 |
+| 方法 | 用途 / 关键参数 | 成功时的 `data` 类型 |
 |---|---|---|
 | `Fanuc_driver(const std::string& robot_ip_address, uint16_t rmi_port = 16001)` | 建立到控制器初始 RMI 端口的 TCP 连接 | 无；连接失败抛异常 |
 | `connect(timeout = std::nullopt)` | 执行 `FRC_Connect` 握手，并连接协商的会话端口 | `ConnectPacket::Response` |
@@ -191,7 +267,7 @@ Asio 异步操作在调用线程中由 `io_context` 驱动；同步接口等待�
 | `programCall(program_name, timeout, params)` | 同步调用并传递参数 |
 | `programCallNonBlocking(program_name)` / `programCallNonBlocking(program_name, params)` | 发送调用请求后立即返回已分配序号的 `ProgramCallPacket::Request` |
 
-参数类型为 `std::vector<rmi::RMICallParam>`；每个元素是 `std::pair<std::string, std::variant<int, float, std::string>>`，依次对应 RMI 的 `ParamTypeN` 和 `ParamValueN`。最多传 10 个参数，超过时在发送前抛出 `std::invalid_argument`，不再静默丢弃多余参数。
+参数类型为 `std::vector<rmi::RMICallParam>`；每个元素是 `std::pair<std::string, std::variant<int, float, std::string>>`，依次对应 RMI 的 `ParamTypeN` 和 `ParamValueN`。最多传 10 个参数；超过时，同步接口返回 `INVALID_PARAMETER`，异步接口在发送前抛出 `std::invalid_argument`，不再静默丢弃多余参数。
 
 ```cpp
 const std::vector<rmi::RMICallParam> args{
@@ -200,7 +276,10 @@ const std::vector<rmi::RMICallParam> args{
   {"Float", 1.25f},
 };
 const auto result = driver.programCall("MY_PROGRAM", 2.0, args);
-std::cout << "SequenceID=" << result.SequenceID << '\n';
+if (result.ok())
+  std::cout << "SequenceID=" << result.data->SequenceID << '\n';
+else
+  std::cerr << result.status.message() << ": " << result.status.detail << '\n';
 ```
 
 程序名、类型标记及参数值必须匹配控制器上 TP 程序的定义。程序调用/参数传输会使用 `setEncoding()` 指定的编码。
@@ -220,7 +299,7 @@ std::cout << "SequenceID=" << result.SequenceID << '\n';
 | 等待数字输入 / 等待时间 | `WaitForDINPacket` / `WaitForTimePacket` |
 | 队列内切换用户坐标系 / 工具坐标系 / 负载表 | `SetUFramePacket` / `SetToolFramePacket` / `SetPayloadInstructionPacket` |
 
-`sendRMIPacket<T>(request, timeout = nullopt)` 对支持的指令发送请求并等待相同序号的响应，返回 `T::Response`。`sendRMIPacketNonBlocking(request)` 只发送指令并将分配的 `SequenceID` 写回传入的请求对象；它不等待指令响应。`sendJointMotion(request, timeout)` 是 `JointMotionJRepPacket` 的同步便捷接口。同步模板的实例化类型必须是库显式支持的上述 packet 类型。
+`sendRMIPacket<T>(request, timeout = nullopt)` 对支持的指令发送请求并等待相同序号的响应，返回 `Response<typename T::Response>`。`sendRMIPacketNonBlocking(request)` 只发送指令并将分配的 `SequenceID` 写回传入的请求对象；它不等待指令响应。`sendJointMotion(request, timeout)` 是 `JointMotionJRepPacket` 的同步便捷接口。同步模板的实例化类型必须是库显式支持的上述 packet 类型。
 
 每种运动请求结构的核心字段如下：
 
@@ -264,7 +343,7 @@ const auto response = driver.sendRMIPacket<rmi::LinearRelativePacket>(move);
 
 ## 5. RMI 数据结构
 
-类型定义位于 `<fanuc_driver/packets.hpp>`，包含该头文件即可通过主头文件使用。结构字段采用与 RMI JSON 键一致的 PascalCase，名称是协议序列化的一部分，不应自行改名。
+类型定义位于 `<robot_driver/drivers/fanuc/packets.hpp>`，也由 FANUC 主头文件包含。结构字段采用与 RMI JSON 键一致的 PascalCase，名称是协议序列化的一部分，不应自行改名。
 
 ### 常用位置类型
 

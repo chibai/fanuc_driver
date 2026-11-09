@@ -8,7 +8,7 @@
 #include <optional>
 #include <string>
 
-#include "fanuc_driver/types.hpp"
+#include "robot_driver/drivers/fanuc/types.hpp"
 
 namespace rmi
 {

@@ -5,9 +5,9 @@
 
 #include <gtest/gtest.h>
 
-#include "detail/line_buffer.hpp"
-#include "detail/serialization.hpp"
-#include "fanuc_driver/fanuc_driver.hpp"
+#include "drivers/fanuc/detail/line_buffer.hpp"
+#include "drivers/fanuc/detail/serialization.hpp"
+#include "robot_driver/drivers/fanuc/robot.hpp"
 
 TEST(ToJSON, ConnectPacket)
 {
@@ -48,6 +48,30 @@ TEST(FromJSON, RejectsInvalidAndNonInstructionPackets)
   EXPECT_FALSE(rmi::FromJSON<rmi::ConnectPacket::Response>("not json"));
   EXPECT_FALSE(rmi::FromJSON<rmi::ConnectPacket::Response>(R"({"Communication":"FRC_Connect"})"));
   EXPECT_FALSE(rmi::IsInstruction(R"({"Command":"FRC_Reset","ErrorID":0})"));
+}
+
+TEST(FromJSON, ErrorResponsesDoNotRequireSuccessData)
+{
+  const auto error =
+      rmi::FromJSON<rmi::ConnectPacket::Response>(R"({"Communication":"FRC_Connect","ErrorID":2556954})");
+  ASSERT_TRUE(error);
+  EXPECT_EQ(error->ErrorID, 2556954);
+  EXPECT_FALSE(rmi::FromJSON<rmi::ConnectPacket::Response>(R"({"Communication":"FRC_Disconnect","ErrorID":2556954})"));
+  EXPECT_FALSE(rmi::FromJSON<rmi::ConnectPacket::Response>(R"({"Communication":"FRC_Connect","ErrorID":0})"));
+  EXPECT_FALSE(rmi::FromJSON<rmi::ConnectPacket::Response>(R"({"Communication":"FRC_Connect","ErrorID":"invalid"})"));
+  EXPECT_FALSE(
+      rmi::FromJSON<rmi::JointMotionPacket::Response>(R"({"Instruction":"FRC_JointMotion","ErrorID":2556959})"));
+  const auto instruction = rmi::FromJSON<rmi::JointMotionPacket::Response>(
+      R"({"Instruction":"FRC_JointMotion","ErrorID":2556959,"SequenceID":7})");
+  ASSERT_TRUE(instruction);
+  EXPECT_EQ(instruction->ErrorID, 2556959);
+  EXPECT_EQ(instruction->SequenceID, 7);
+  const auto unknown = rmi::FromJSON<rmi::UnknownPacket>(R"({"Command":"Unknown","ErrorID":42})");
+  ASSERT_TRUE(unknown);
+  EXPECT_FALSE(unknown->SequenceID);
+  const auto correlated = rmi::FromJSON<rmi::UnknownPacket>(R"({"Command":"Unknown","ErrorID":42,"SequenceID":9})");
+  ASSERT_TRUE(correlated);
+  EXPECT_EQ(correlated->SequenceID, 9);
 }
 
 TEST(RmiLineBuffer, PreservesPartialFramesAcrossAppends)
