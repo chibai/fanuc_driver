@@ -6,8 +6,8 @@
 #include <gtest/gtest.h>
 
 #include "drivers/fanuc/detail/line_buffer.hpp"
+#include "drivers/fanuc/detail/packets.hpp"
 #include "drivers/fanuc/detail/serialization.hpp"
-#include "robot_driver/drivers/fanuc/robot.hpp"
 
 TEST(ToJSON, ConnectPacket)
 {

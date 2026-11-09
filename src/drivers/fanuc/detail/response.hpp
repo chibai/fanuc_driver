@@ -41,11 +41,11 @@ std::expected<T, ResponseStatus> captureExpected(Operation&& operation)
   }
   catch (const std::invalid_argument& error)
   {
-    return std::unexpected(ResponseStatus{ ResponseCode::INVALID_PARAMETER, error.what(), std::nullopt });
+    return std::unexpected(ResponseStatus{ ResponseCode::INVALID_PARAMETER, error.what() });
   }
   catch (const boost::system::system_error& error)
   {
-    return std::unexpected(ResponseStatus{ ResponseCode::CONNECTION_ERROR, error.what(), std::nullopt });
+    return std::unexpected(ResponseStatus{ ResponseCode::CONNECTION_ERROR, error.what() });
   }
 }
 

@@ -19,14 +19,14 @@ enum class ResponseCode : int
   INDEX_OUT_OF_RANGE = 1901,
   CONTROLLER_ERROR = 3000,
   WAITING_TIMEOUT = 4411,
-  SERVER_ERR = 9998
+  SERVER_ERR = 9998,
+  CUSTOM_ERROR = 9999
 };
 
 struct [[nodiscard]] ResponseStatus
 {
   ResponseCode value = ResponseCode::OK;
   std::string detail;
-  std::optional<int> controller_error;
 
   [[nodiscard]] int code() const
   {

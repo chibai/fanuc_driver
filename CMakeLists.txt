@@ -21,6 +21,7 @@ find_package(Iconv REQUIRED)
 add_library(fanuc_driver SHARED
     src/core/error.cpp
     src/drivers/fanuc/robot.cpp
+    src/drivers/fanuc/rmi_driver.cpp
     src/drivers/fanuc/serialization.cpp
     src/drivers/fanuc/deserialization.cpp
 )

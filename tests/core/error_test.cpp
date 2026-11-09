@@ -18,12 +18,11 @@ TEST(ResponseStatus, CodesAndTranslations)
   EXPECT_EQ(success.message("en"), "Success");
   EXPECT_EQ(success.message("de"), "Erfolg");
   EXPECT_EQ(success.message("unsupported"), success.message("zh"));
-  const ResponseStatus error{ ResponseCode::CONTROLLER_ERROR, "FANUC detail", 2556940 };
+  const ResponseStatus error{ ResponseCode::CUSTOM_ERROR, "Custom failure detail" };
   EXPECT_FALSE(error.ok());
-  EXPECT_EQ(error.code(), 3000);
-  EXPECT_EQ(error.message("en"), "Controller error");
-  EXPECT_EQ(error.controller_error, 2556940);
-  EXPECT_EQ(error.detail, "FANUC detail");
+  EXPECT_EQ(error.code(), 9999);
+  EXPECT_EQ(error.message("en"), "Custom error");
+  EXPECT_EQ(error.detail, "Custom failure detail");
 
   constexpr std::array codes{ ResponseCode::OK,
                               ResponseCode::INCOMPATIBLE_VERSION,
@@ -36,10 +35,11 @@ TEST(ResponseStatus, CodesAndTranslations)
                               ResponseCode::INDEX_OUT_OF_RANGE,
                               ResponseCode::CONTROLLER_ERROR,
                               ResponseCode::WAITING_TIMEOUT,
-                              ResponseCode::SERVER_ERR };
+                              ResponseCode::SERVER_ERR,
+                              ResponseCode::CUSTOM_ERROR };
   for (auto code : codes)
     for (auto language : { "zh", "en", "de" })
-      EXPECT_NE(ResponseStatus({ code, {}, std::nullopt }).message(language), "Unknown response status");
+      EXPECT_NE(ResponseStatus({ code, {} }).message(language), "Unknown response status");
 }
 
 TEST(ResponseStatus, EnvironmentLanguageIsReadOnEachCall)

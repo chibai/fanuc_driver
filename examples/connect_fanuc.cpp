@@ -26,16 +26,11 @@ int main(int argc, char* argv[])
     Robot_driver& driver = fanuc;
     const auto connection = fanuc.connect();
     if (!connection.ok())
-      return reportError(connection.status);
-    std::cout << "RMI version: " << connection.data->MajorVersion << '.' << connection.data->MinorVersion << '\n';
+      return reportError(connection);
     const auto status = driver.getStatus();
     if (!status.ok())
       return reportError(status.status);
     std::cout << "Servo ready: " << status.data->servo_ready << '\n';
-    const auto joints = fanuc.readJointAngles();
-    if (!joints.ok())
-      return reportError(joints.status);
-    std::cout << "J1: " << joints.data->JointAngle.J1 << " degrees\n";
     const auto disconnected = driver.disconnect();
     if (!disconnected.ok())
       return reportError(disconnected);

@@ -25,10 +25,9 @@ TEST(ResponseStatus, ExpectedPreservesValuesAndTypedErrors)
   ASSERT_TRUE(number.has_value());
   EXPECT_EQ(*number, 0);
   const auto error = rmi::detail::captureExpected<int>(
-      []() -> int { throw rmi::detail::ResponseError({ ResponseCode::CONTROLLER_ERROR, "controller failure", 42 }); });
+      []() -> int { throw rmi::detail::ResponseError({ ResponseCode::CUSTOM_ERROR, "controller failure" }); });
   ASSERT_FALSE(error.has_value());
-  EXPECT_EQ(error.error().code(), 3000);
-  EXPECT_EQ(error.error().controller_error, 42);
+  EXPECT_EQ(error.error().code(), 9999);
   EXPECT_EQ(error.error().detail, "controller failure");
   const auto invalid = rmi::detail::captureExpected<int>([]() -> int { throw std::invalid_argument("invalid input"); });
   ASSERT_FALSE(invalid.has_value());
