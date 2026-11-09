@@ -2,8 +2,8 @@
 
 C++23 机械臂驱动库，提供品牌无关的抽象基类 `Robot_driver`，
 目前实现的品牌驱动为 FANUC Remote Motion Interface（RMI）的 `Fanuc_driver`。
-`Fanuc_driver` 公开继承 `Robot_driver`；FANUC 协议数据类型保留在 `rmi` 命名空间，
-不需要创建其他连接对象。
+`Fanuc_driver` 公开继承 `Robot_driver`，只提供协议无关接口；
+RMI 数据类型和通信实现通过 PImpl 隐藏，不随安装包发布。
 
 本次为不兼容重构：移除 Stream Motion、GPIO 缓冲和 YAML 配置、Eigen、
 `fanuc_client`、单例以及旧 `fanuc_driver` / `RMIConnection` 接口，不保留兼容层。
@@ -19,16 +19,15 @@ include/robot_driver/
 │   ├── types.hpp                RobotStatus
 │   └── error.hpp                ResponseCode、ResponseStatus、Response<T>
 └── drivers/fanuc/
-    ├── robot.hpp                Fanuc_driver 公开接口
-    ├── packets.hpp              公共 RMI 请求、响应和运动数据
-    └── types.hpp                指令响应和程序调用参数
+    └── robot.hpp                Fanuc_driver 公开接口，仅依赖 core
 src/
 ├── core/error.cpp               通用状态消息
 └── drivers/fanuc/
-    ├── robot.cpp                TCP 通信和 RMI 实现
+    ├── robot.cpp                PImpl 和通用接口适配
+    ├── rmi_driver.cpp           内部 TCP 通信和 RMI 实现
     ├── serialization.cpp
     ├── deserialization.cpp
-    └── detail/                  内部 JSON 映射、序列化、错误适配和 TCP 分帧
+    └── detail/                  packets.hpp、types.hpp、内部驱动及协议辅助头文件
 tests/
 ├── CMakeLists.txt
 ├── core/                        契约和状态测试
@@ -45,9 +44,9 @@ LICENSES/                        保留原有许可证文本
 完整的公开接口、参数和数据类型说明见 [接口文档](docs/API.md)。
 目录依赖边界见 [架构说明](docs/architecture.md)。只创建已有实现对应的目录，
 暂不提供其他品牌、型号、运动学或规划模块。FANUC 仍使用 RMI，不是 FOCAS。
-本次只调整目录和头文件入口，保留 `Robot_driver`、`Fanuc_driver`、`rmi` 的名称及
+保留 `Robot_driver`、`Fanuc_driver` 的名称及
 `find_package(fanuc_driver 3)` / `fanuc_driver::fanuc_driver` 构建契约。
-旧 `<fanuc_driver/...>` 头文件路径已迁移到 `<robot_driver/drivers/fanuc/...>`；
+RMI 协议包、运动和扩展接口现仅供内部实现使用，不再是公开 API；
 品牌无关代码应包含 `<robot_driver/core/robot.hpp>`，聚合入口为 `<robot_driver/robot_driver.hpp>`。
 
 ## 构建
@@ -145,15 +144,15 @@ int main()
 品牌驱动不支持某操作时应返回 `INTERFACE_NOTIMPLEMENTED`，不得静默忽略或伪造成功。
 
 基类采用非虚公开入口调用纯虚 `do*` 方法（NVI）。
-通过基类调用获得品牌无关的状态或数据。`Fanuc_driver` 的数字输入、通用 I/O、
-数值寄存器和位置寄存器读取返回 `std::expected<原协议响应, ResponseStatus>`；
-其他同步调用保持 `Response<rmi::*Packet::Response>`，原始协议字段保留在 `data` 中。
-FANUC 专用的运动报文、构型、坐标系、寄存器、系统变量等仍仅在派生类提供，
-本次不统一不同品牌的运动单位、构型或队列语义，也未实现其他品牌的通信协议。
+直接通过 `Fanuc_driver` 或通过基类调用，均获得相同的通用状态和数据。
+公开控制方法返回 `ResponseStatus`，状态查询返回 `Response<RobotStatus>`，
+数字输入读取返回 `std::expected<bool, ResponseStatus>`，不包含 RMI 数据或错误码。
+FANUC 专用的运动报文、构型、坐标系、寄存器、系统变量等实现保留在内部驱动中，
+不再通过公开类暴露；本次不新增这些功能的品牌无关数据模型。
 基类具有虚析构函数，禁止复制和移动；析构不发送停止或断开命令。
 本次返回类型和错误处理方式不兼容旧接口，升级时需修改调用代码并重新编译下游程序。
 
-### FANUC 原生接口
+### 直接使用 FANUC 驱动
 
 ```cpp
 #include <robot_driver/drivers/fanuc/robot.hpp>
@@ -163,21 +162,18 @@ int main()
   Fanuc_driver driver("192.168.1.100");  // 默认 RMI 端口 16001
   const auto connection = driver.connect();
   if (!connection.ok())
-    return connection.status.code();
+    return connection.code();
   const auto status = driver.getStatus();
   if (!status.ok())
     return status.status.code();
-  const auto joints = driver.readJointAngles();
-  if (!joints.ok())
-    return joints.status.code();
-  // joints.data->JointAngle.J1
-  return driver.disconnect().status.code();
+  // status.data->servo_ready / status.data->speed_override
+  return driver.disconnect().code();
 }
 ```
 
 构造函数打开初始 TCP 连接；`connect()` 执行 RMI 握手，并连接控制器返回的会话端口。
 状态查询不自动初始化运动，也不会读取 Stream Motion 变量或运动限制。
-显式调用 `initializeRemoteMotion()` 后才应发送运动指令；结束运动使用 `abort()`，
+公开接口不提供运动报文发送；运动初始化使用 `initializeRemoteMotion()`，中止使用 `abort()`，
 结束会话使用 `disconnect()`。析构仅释放 TCP 资源，不隐式发送停止或复位命令，
 不能作为机器人安全停止机制。
 
@@ -193,34 +189,27 @@ C++23 `std::views::zip` 映射程序参数，以及 ranges 投影查找和移动
 超时参数以秒为单位，省略或 `std::nullopt` 为 1 秒，负数表示无限等待。
 超时必须为有限值；NaN 和无穷大返回 `INVALID_PARAMETER`。
 同步调用的网络断开、响应超时和控制器非零 `ErrorID` 分别返回 `CONNECTION_ERROR`、
-`WAITING_TIMEOUT`、`CONTROLLER_ERROR`。`Response<T>` 失败时 `data` 为空；
-I/O 和寄存器读取的 `std::expected` 失败时没有值，通过 `error()` 获取 `ResponseStatus`。
+`WAITING_TIMEOUT`、`CUSTOM_ERROR`（9999）。`Response<T>` 失败时 `data` 为空；
+数字输入读取的 `std::expected` 失败时没有值，通过 `error()` 获取 `ResponseStatus`。
 `response.status.code()` 提供统一数值码，`message()` 提供用户消息，`detail` 保留诊断详情，
-`controller_error` 保留原始 FANUC 错误码（不与统一码混用）。
+RMI 响应中的非零 FANUC `ErrorID` 统一映射为 `CUSTOM_ERROR`（9999），
+错误说明保存在 `detail`，不再单独返回原始 RMI 错误码。
 消息读取 `ROBOTDRIVERCORE_LANGUAGE=zh/en/de`，默认或未知语言回退中文，
 也可显式调用 `message("en")`；翻译随库编译，无需部署外部 CSV。
-构造函数仍立即建连并可能抛异常；异步发送、推送查询和指令窗口查询仍保留原有异常语义。
+构造函数仍立即建连并可能抛异常。
 资源分配失败和程序逻辑错误不会被包装为普通操作状态。
 
 ```cpp
 const auto input = driver.readDigitalInputPort(1);
 if (input)
-  std::cout << input->PortValue << '\n';  // Robot_driver 接口则为 *input（bool）
+  std::cout << *input << '\n';
 else
   std::cerr << input.error().code() << ": " << input.error().message() << '\n';
-
-const auto reg = driver.readNumericRegister(1);
-if (reg)
-  std::visit([](auto value) { std::cout << value << '\n'; }, reg->RegisterValue);
-else
-  std::cerr << reg.error().detail << '\n';
 ```
 
 `std::expected` 的布尔转换表示“是否读取成功”，不代表读取到的电平或数值。
-仅在失败时调用 `error()`，仅在成功时解引用；本次四类读取接口需由旧的 `.data` / `.status`
-调用方式迁移到标准 `std::expected` 接口。
-`check*` 无对应推送包时返回 `std::nullopt`，不代表通信失败。
-扩展命令是否可用取决于控制器版本与选项，尤其是变量写入。
+仅在失败时调用 `error()`，仅在成功时解引用。
+旧协议返回值需迁移为上述通用返回值；原有协议专用扩展不属于公开接口。
 
 示例不发送运动或 I/O 写命令：
 
@@ -228,9 +217,22 @@ else
 ./build/fanuc_driver_example 192.168.1.100
 ```
 
-## 已实现功能
+## 公开功能
 
 | 功能 | `Fanuc_driver` 方法 |
+|---|---|
+| 连接、端口协商、断开 | `connect`、`disconnect` |
+| 运动初始化 | `initializeRemoteMotion` |
+| 暂停、继续、中止、复位、速度倍率 | `pause`、`resume`、`abort`、`reset`、`setSpeedOverride` |
+| 伺服就绪、速度倍率查询 | `getStatus` |
+| 数字输入读取、数字输出写入 | `readDigitalInputPort`、`writeDigitalOutputPort` |
+
+## 内部协议实现
+
+以下功能保留在 `src/drivers/fanuc/detail/rmi_driver.hpp` 的 `FanucRmiDriver` 中，
+用于协议实现和内部测试，**不是 `Fanuc_driver` 的公开成员**，安装包不能调用。
+
+| 功能 | `FanucRmiDriver` 内部方法 |
 |---|---|
 | RMI 连接、端口协商、断开 | `connect`、`disconnect` |
 | 运动初始化（含 GroupMask / RTSA / PLTZMODE） | `initializeRemoteMotion` |

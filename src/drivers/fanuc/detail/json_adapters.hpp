@@ -11,8 +11,8 @@
 
 #include <nlohmann/json.hpp>
 
-#include "robot_driver/drivers/fanuc/packets.hpp"
-#include "robot_driver/drivers/fanuc/types.hpp"
+#include "packets.hpp"
+#include "types.hpp"
 
 namespace nlohmann
 {

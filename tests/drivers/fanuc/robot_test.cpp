@@ -11,6 +11,7 @@
 #include <vector>
 
 #include <boost/asio.hpp>
+#include "drivers/fanuc/detail/rmi_driver.hpp"
 #include "robot_driver/drivers/fanuc/robot.hpp"
 
 using namespace std::chrono_literals;
@@ -165,6 +166,10 @@ static_assert(!std::is_copy_constructible_v<Fanuc_driver>);
 static_assert(!std::is_move_constructible_v<Fanuc_driver>);
 static_assert(std::is_base_of_v<Robot_driver, Fanuc_driver>);
 static_assert(!std::is_abstract_v<Fanuc_driver>);
+static_assert(std::is_same_v<decltype(std::declval<Fanuc_driver&>().connect()), ResponseStatus>);
+static_assert(std::is_same_v<decltype(std::declval<Fanuc_driver&>().getStatus()), Response<RobotStatus>>);
+static_assert(std::is_same_v<decltype(std::declval<Fanuc_driver&>().readDigitalInputPort(1)),
+                             std::expected<bool, ResponseStatus>>);
 }  // namespace
 
 TEST(FanucDriver, BrandIndependentInterface)
@@ -226,11 +231,49 @@ TEST(FanucDriver, BrandIndependentInterfaceReturnsErrors)
   Robot_driver& driver = fanuc;
   ASSERT_TRUE(driver.connect().ok());
   const auto pause = driver.pause();
-  EXPECT_EQ(pause.code(), 3000);
-  EXPECT_EQ(pause.controller_error, 2556938);
+  EXPECT_EQ(pause.code(), 9999);
+  EXPECT_NE(pause.detail.find("TP Program is Not Paused"), std::string::npos);
   const auto status = driver.getStatus();
   EXPECT_EQ(status.status.value, ResponseCode::CONNECTION_ERROR);
   EXPECT_FALSE(status.data);
+  ASSERT_NO_THROW(controller.finish());
+}
+
+TEST(FanucDriver, ConcreteInterfaceReturnsOnlyCoreTypes)
+{
+  Controller controller({
+      { "FRC_Reset", R"({"Command":"FRC_Reset","ErrorID":2556940})" },
+      { "FRC_Pause", R"({"Command":"FRC_Pause","ErrorID":42})" },
+      { "FRC_ReadDIN", R"({"Command":"FRC_ReadDIN","ErrorID":0,"PortNumber":1,"PortValue":0})" },
+      { "FRC_ReadDIN", R"({"Command":"FRC_ReadDIN","ErrorID":2556966})" },
+      { "FRC_GetStatus", R"({"Command":"FRC_GetStatus","ErrorID":2556942})" },
+      { "FRC_GetStatus", "" },
+  });
+  Fanuc_driver driver("127.0.0.1", controller.port());
+  ASSERT_TRUE(driver.connect().ok());
+
+  const auto reset = driver.reset();
+  EXPECT_FALSE(reset.ok());
+  EXPECT_EQ(reset.code(), 9999);
+  EXPECT_NE(reset.detail.find("Cannot Reset Controller"), std::string::npos);
+  const auto pause = driver.pause();
+  EXPECT_EQ(pause.code(), 9999);
+  EXPECT_NE(pause.detail.find("Unknown Error Code: 42"), std::string::npos);
+
+  const auto off = driver.readDigitalInputPort(1);
+  ASSERT_TRUE(off.has_value());
+  EXPECT_FALSE(*off);
+  const auto input_error = driver.readDigitalInputPort(1);
+  ASSERT_FALSE(input_error.has_value());
+  EXPECT_EQ(input_error.error().code(), 9999);
+  EXPECT_NE(input_error.error().detail.find("Invalid Port Number"), std::string::npos);
+  const auto status_error = driver.getStatus();
+  EXPECT_EQ(status_error.status.code(), 9999);
+  EXPECT_FALSE(status_error.data);
+  EXPECT_NE(status_error.status.detail.find("RMI Command Fail"), std::string::npos);
+  const auto timeout = driver.getStatus(0.01);
+  EXPECT_EQ(timeout.status.value, ResponseCode::WAITING_TIMEOUT);
+  EXPECT_FALSE(timeout.data);
   ASSERT_NO_THROW(controller.finish());
 }
 
@@ -247,7 +290,7 @@ TEST(FanucDriver, StandardRmiSessionAndControl)
       { "FRC_Reset", R"({"Command":"FRC_Reset","ErrorID":0})" },
       { "FRC_Disconnect", R"({"Communication":"FRC_Disconnect","ErrorID":0})" },
   });
-  Fanuc_driver driver("127.0.0.1", controller.port());
+  FanucRmiDriver driver("127.0.0.1", controller.port());
   EXPECT_EQ(driver.connect().data.value().MajorVersion, 3);
   ASSERT_TRUE(driver.initializeRemoteMotion(1.0, 1, "ON", "OFF").ok());
   EXPECT_EQ(driver.getStatus().data.value().ServoReady, 1);
@@ -275,7 +318,7 @@ TEST(FanucDriver, RegistersIoAndVariables)
         R"({"Command":"FRC_ReadVariable","ErrorID":0,"VariableName":"$TEST","VariableType":"Integer","VariableValue":7})" },
       { "FRC_WriteVariable", R"({"Command":"FRC_WriteVariable","ErrorID":0,"VariableName":"$TEST"})" },
   });
-  Fanuc_driver driver("127.0.0.1", controller.port());
+  FanucRmiDriver driver("127.0.0.1", controller.port());
   ASSERT_TRUE(driver.connect().ok());
   EXPECT_FLOAT_EQ(std::get<float>(driver.readNumericRegister(1).value().RegisterValue), 1.5f);
   ASSERT_TRUE(driver.writeNumericRegister(1, 2.5f).ok());
@@ -302,7 +345,7 @@ TEST(FanucDriver, ExpectedReadsPreserveErrorsAndZeroValues)
       { "FRC_ReadIOPort", "" },
       { "FRC_ReadDIN", "", 0ms, 0, true },
   });
-  Fanuc_driver fanuc("127.0.0.1", controller.port());
+  FanucRmiDriver fanuc("127.0.0.1", controller.port());
   Robot_driver& robot = fanuc;
   ASSERT_TRUE(robot.connect().ok());
   const auto off = robot.readDigitalInputPort(1);
@@ -314,23 +357,21 @@ TEST(FanucDriver, ExpectedReadsPreserveErrorsAndZeroValues)
 
   const auto input = robot.readDigitalInputPort(1);
   ASSERT_FALSE(input.has_value());
-  EXPECT_EQ(input.error().value, ResponseCode::CONTROLLER_ERROR);
-  EXPECT_EQ(input.error().controller_error, 2556966);
+  EXPECT_EQ(input.error().code(), 9999);
   EXPECT_FALSE(input.error().detail.empty());
   const auto io = fanuc.readIOPort("AI", 1);
   ASSERT_FALSE(io.has_value());
-  EXPECT_EQ(io.error().controller_error, 42);
+  EXPECT_EQ(io.error().code(), 9999);
   EXPECT_NE(io.error().detail.find("Unknown Error Code: 42"), std::string::npos);
   const auto numeric = fanuc.readNumericRegister(1);
   ASSERT_FALSE(numeric.has_value());
-  EXPECT_EQ(numeric.error().controller_error, 2556942);
+  EXPECT_EQ(numeric.error().code(), 9999);
   const auto position = fanuc.readPositionRegister(1);
   ASSERT_FALSE(position.has_value());
-  EXPECT_EQ(position.error().controller_error, 2556932);
+  EXPECT_EQ(position.error().code(), 9999);
   const auto timeout = fanuc.readIOPort("AI", 1, 0.01);
   ASSERT_FALSE(timeout.has_value());
   EXPECT_EQ(timeout.error().value, ResponseCode::WAITING_TIMEOUT);
-  EXPECT_FALSE(timeout.error().controller_error);
   const auto closed = robot.readDigitalInputPort(1);
   ASSERT_FALSE(closed.has_value());
   EXPECT_EQ(closed.error().value, ResponseCode::CONNECTION_ERROR);
@@ -346,7 +387,7 @@ TEST(FanucDriver, MotionRepliesAndSequenceTracking)
       { "FRC_WaitTime", R"({"Instruction":"FRC_WaitTime","ErrorID":0,"SequenceID":3})" },
       { "FRC_Call", R"({"Instruction":"FRC_Call","ErrorID":0,"SequenceID":4})" },
   });
-  Fanuc_driver driver("127.0.0.1", controller.port());
+  FanucRmiDriver driver("127.0.0.1", controller.port());
   ASSERT_TRUE(driver.connect().ok());
   ASSERT_TRUE(driver.initializeRemoteMotion().ok());
   EXPECT_EQ(driver.getRemainingBufferSize(), 8);
@@ -377,17 +418,15 @@ TEST(FanucDriver, ControllerErrorsAndTimeoutsAreReported)
       { "FRC_Reset", R"({"Command":"FRC_Reset","ErrorID":2556940})" },
       { "FRC_GetStatus", "" },
   });
-  Fanuc_driver driver("127.0.0.1", controller.port());
+  FanucRmiDriver driver("127.0.0.1", controller.port());
   ASSERT_TRUE(driver.connect().ok());
   const auto reset = driver.reset();
   EXPECT_FALSE(reset.ok());
   EXPECT_FALSE(reset.data);
-  EXPECT_EQ(reset.status.code(), 3000);
-  EXPECT_EQ(reset.status.controller_error, 2556940);
+  EXPECT_EQ(reset.status.code(), 9999);
   EXPECT_NE(reset.status.detail.find("Cannot Reset Controller"), std::string::npos);
   const auto status = driver.getStatus(0.01);
   EXPECT_EQ(status.status.code(), 4411);
-  EXPECT_FALSE(status.status.controller_error);
   EXPECT_FALSE(status.data);
   ASSERT_NO_THROW(controller.finish());
 }
@@ -399,7 +438,7 @@ TEST(FanucDriver, FragmentedAndLargeResponses)
       { "FRC_Reset", R"({"Command":"FRC_Reset","ErrorID":0})", 0ms, 1 },
       { "FRC_ReadError", R"({"Command":"FRC_ReadError","ErrorID":0,"ErrorData":")" + alarm + R"("})" },
   });
-  Fanuc_driver driver("localhost", controller.port());
+  FanucRmiDriver driver("localhost", controller.port());
   ASSERT_TRUE(driver.connect().ok());
   EXPECT_EQ(driver.reset().data.value().ErrorID, 0);
   EXPECT_EQ(driver.readError().data.value().ErrorData, alarm);
@@ -414,23 +453,21 @@ TEST(FanucDriver, ForwardedAndTemplateCallsPreserveControllerErrors)
       { "FRC_ReadUFrameData", R"({"Command":"FRC_ReadUFrameData","ErrorID":2556931})" },
       { "FRC_JointMotionJRep", R"({"Instruction":"FRC_JointMotionJRep","ErrorID":2556959,"SequenceID":2})" },
   });
-  Fanuc_driver driver("127.0.0.1", controller.port());
+  FanucRmiDriver driver("127.0.0.1", controller.port());
   ASSERT_TRUE(driver.connect().ok());
   const auto error = driver.readError();
-  EXPECT_EQ(error.status.value, ResponseCode::CONTROLLER_ERROR);
-  EXPECT_EQ(error.status.controller_error, 42);
+  EXPECT_EQ(error.status.code(), 9999);
   EXPECT_NE(error.status.detail.find("Unknown Error Code: 42"), std::string::npos);
   EXPECT_FALSE(error.data);
   const auto program = driver.programCall("TEST");
-  EXPECT_EQ(program.status.controller_error, 2556940);
+  EXPECT_EQ(program.status.code(), 9999);
   EXPECT_FALSE(program.data);
   const auto frame = driver.readUFrameData(1);
-  EXPECT_EQ(frame.status.controller_error, 2556931);
+  EXPECT_EQ(frame.status.code(), 9999);
   EXPECT_FALSE(frame.data);
   rmi::JointMotionJRepPacket::Request request{};
   const auto motion = driver.sendRMIPacket<rmi::JointMotionJRepPacket>(request);
-  EXPECT_EQ(motion.status.code(), 3000);
-  EXPECT_EQ(motion.status.controller_error, 2556959);
+  EXPECT_EQ(motion.status.code(), 9999);
   EXPECT_FALSE(motion.data);
   ASSERT_NO_THROW(controller.finish());
 }
@@ -438,7 +475,7 @@ TEST(FanucDriver, ForwardedAndTemplateCallsPreserveControllerErrors)
 TEST(FanucDriver, InvalidParametersReturnStatusWithoutSendingCommands)
 {
   Controller controller({ { "FRC_Pause", R"({"Command":"FRC_Pause","ErrorID":0})" } });
-  Fanuc_driver driver("127.0.0.1", controller.port());
+  FanucRmiDriver driver("127.0.0.1", controller.port());
   ASSERT_TRUE(driver.connect().ok());
   const auto check = [](const auto& response) {
     EXPECT_EQ(response.status.value, ResponseCode::INDEX_OUT_OF_RANGE);
@@ -472,7 +509,7 @@ TEST(FanucDriver, InvalidParametersReturnStatusWithoutSendingCommands)
 TEST(FanucDriver, NewSessionDiscardsHandshakeFragment)
 {
   Controller controller({ { "FRC_Reset", R"({"Command":"FRC_Reset","ErrorID":0})" } }, R"({"stale":)");
-  Fanuc_driver driver("127.0.0.1", controller.port());
+  FanucRmiDriver driver("127.0.0.1", controller.port());
   EXPECT_EQ(driver.connect().data.value().MajorVersion, 3);
   EXPECT_EQ(driver.reset().data.value().ErrorID, 0);
   ASSERT_NO_THROW(controller.finish());
@@ -484,7 +521,7 @@ TEST(FanucDriver, ResponseTimeoutPreservesPendingRead)
       { "FRC_Reset", R"({"Command":"FRC_Reset","ErrorID":0})", 100ms },
       { "FRC_Pause", R"({"Command":"FRC_Pause","ErrorID":0})" },
   });
-  Fanuc_driver driver("127.0.0.1", controller.port());
+  FanucRmiDriver driver("127.0.0.1", controller.port());
   ASSERT_TRUE(driver.connect().ok());
   const auto start = std::chrono::steady_clock::now();
   const auto response = driver.reset(0.01);
@@ -501,7 +538,7 @@ TEST(FanucDriver, UnlimitedAndLargeTimeoutsWaitForData)
       { "FRC_Reset", R"({"Command":"FRC_Reset","ErrorID":0})", 20ms },
       { "FRC_Pause", R"({"Command":"FRC_Pause","ErrorID":0})", 20ms },
   });
-  Fanuc_driver driver("127.0.0.1", controller.port());
+  FanucRmiDriver driver("127.0.0.1", controller.port());
   ASSERT_TRUE(driver.connect().ok());
   EXPECT_EQ(driver.reset(-1.0).data.value().ErrorID, 0);
   EXPECT_EQ(driver.pause(std::numeric_limits<double>::max()).data.value().ErrorID, 0);
@@ -516,7 +553,7 @@ TEST(FanucDriver, NonFiniteTimeoutsAreReported)
       { "FRC_Reset", "" },
       { "FRC_Pause", R"({"Command":"FRC_Pause","ErrorID":0})" },
   });
-  Fanuc_driver driver("127.0.0.1", controller.port());
+  FanucRmiDriver driver("127.0.0.1", controller.port());
   ASSERT_TRUE(driver.connect().ok());
   for (const auto timeout : { std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::infinity(),
                               -std::numeric_limits<double>::infinity() })
@@ -533,7 +570,7 @@ TEST(FanucDriver, NonFiniteTimeoutsAreReported)
 TEST(FanucDriver, PushChecksDoNotWaitForData)
 {
   Controller controller({ { "FRC_Reset", R"({"Command":"FRC_Reset","ErrorID":0})" } });
-  Fanuc_driver driver("127.0.0.1", controller.port());
+  FanucRmiDriver driver("127.0.0.1", controller.port());
   ASSERT_TRUE(driver.connect().ok());
   ASSERT_TRUE(driver.reset().ok());
   const auto start = std::chrono::steady_clock::now();
@@ -549,7 +586,7 @@ TEST(FanucDriver, PushChecksDoNotWaitForData)
 TEST(FanucDriver, CompleteResponseBeforeEofIsDelivered)
 {
   Controller controller({ { "FRC_Reset", R"({"Command":"FRC_Reset","ErrorID":0})", 0ms, 0, true } });
-  Fanuc_driver driver("127.0.0.1", controller.port());
+  FanucRmiDriver driver("127.0.0.1", controller.port());
   ASSERT_TRUE(driver.connect().ok());
   EXPECT_EQ(driver.reset().data.value().ErrorID, 0);
   ASSERT_NO_THROW(controller.finish());
@@ -559,7 +596,7 @@ TEST(FanucDriver, CompleteResponseBeforeEofIsDelivered)
 TEST(FanucDriver, EofWithoutCompleteResponseIsReported)
 {
   Controller controller({ { "FRC_Reset", R"({"Command":)", 0ms, 0, true, false } });
-  Fanuc_driver driver("127.0.0.1", controller.port());
+  FanucRmiDriver driver("127.0.0.1", controller.port());
   ASSERT_TRUE(driver.connect().ok());
   const auto response = driver.reset();
   EXPECT_EQ(response.status.value, ResponseCode::CONNECTION_ERROR);
@@ -574,7 +611,7 @@ TEST(FanucDriver, RefusedConnectionIsReported)
   boost::asio::ip::tcp::acceptor listener(context, { boost::asio::ip::make_address("127.0.0.1"), 0 });
   const auto port = listener.local_endpoint().port();
   listener.close();
-  EXPECT_THROW(Fanuc_driver("127.0.0.1", port), std::runtime_error);
+  EXPECT_THROW(FanucRmiDriver("127.0.0.1", port), std::runtime_error);
 }
 
 TEST(FanucDriver, ProgramCallMapsTenArgumentsAndRejectsOverflow)
@@ -583,7 +620,7 @@ TEST(FanucDriver, ProgramCallMapsTenArgumentsAndRejectsOverflow)
       { "FRC_Call", R"({"Instruction":"FRC_Call","ErrorID":0,"SequenceID":1})" },
       { "FRC_Call", R"({"Instruction":"FRC_Call","ErrorID":0,"SequenceID":2})" },
   });
-  Fanuc_driver driver("127.0.0.1", controller.port());
+  FanucRmiDriver driver("127.0.0.1", controller.port());
   ASSERT_TRUE(driver.connect().ok());
   std::vector<rmi::RMICallParam> params;
   for (int i = 1; i <= 10; ++i)
@@ -632,7 +669,7 @@ TEST(FanucDriver, CoordinatesPositionsAndPayloads)
         R"({"Command":"FRC_GetPayloadComp","ErrorID":0,"Mass":3,"CG_X":0,"CG_Y":0,"CG_Z":0,"IN_X":0,"IN_Y":0,"IN_Z":0})" },
       { "FRC_SetPayloadComp", R"({"Command":"FRC_SetPayloadComp","ErrorID":0})" },
   });
-  Fanuc_driver driver("127.0.0.1", controller.port());
+  FanucRmiDriver driver("127.0.0.1", controller.port());
   ASSERT_TRUE(driver.connect().ok());
   EXPECT_EQ(driver.getUFrameUTool().data.value().UFrameNumber, 2);
   ASSERT_TRUE(driver.setUFrameUTool(2, 1, 1.0, 1).ok());
@@ -681,7 +718,7 @@ TEST(FanucDriver, DiagnosticsAndPushPackets)
                          "\x83\x65\x83\x58\x83\x67"
                          R"("})" },
   });
-  Fanuc_driver driver("127.0.0.1", controller.port());
+  FanucRmiDriver driver("127.0.0.1", controller.port());
   ASSERT_TRUE(driver.connect().ok());
   EXPECT_EQ(driver.readError(1.0, 2).data.value().ErrorData2, "detail");
   EXPECT_EQ(driver.getExtendedStatus().data.value().DrivesPowered, 1);
@@ -728,7 +765,7 @@ TYPED_TEST(RmiInstruction, BlockingAndNonBlocking)
       { request.Instruction, response(0) + "\r\n" + response(1) },
       { request.Instruction, response(2) },
   });
-  Fanuc_driver driver("127.0.0.1", controller.port());
+  FanucRmiDriver driver("127.0.0.1", controller.port());
   ASSERT_TRUE(driver.connect().ok());
   ASSERT_TRUE(driver.initializeRemoteMotion().ok());
   EXPECT_EQ(driver.sendRMIPacket<TypeParam>(request).data.value().SequenceID, 1);

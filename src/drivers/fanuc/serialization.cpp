@@ -6,7 +6,7 @@
 #include "detail/serialization.hpp"
 #include "detail/json_adapters.hpp"
 
-#include "robot_driver/drivers/fanuc/packets.hpp"
+#include "detail/packets.hpp"
 
 namespace rmi
 {

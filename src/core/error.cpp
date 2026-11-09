@@ -32,7 +32,8 @@ constexpr std::array translations{
                "Steuerungsfehler" },
   Translation{ ResponseCode::WAITING_TIMEOUT, "执行等待超时", "Response wait timeout",
                "Zeitueberschreitung beim Warten auf die Antwort" },
-  Translation{ ResponseCode::SERVER_ERR, "其他原因", "Other error", "Sonstiger Fehler" }
+  Translation{ ResponseCode::SERVER_ERR, "其他原因", "Other error", "Sonstiger Fehler" },
+  Translation{ ResponseCode::CUSTOM_ERROR, "自定义错误", "Custom error", "Benutzerdefinierter Fehler" }
 };
 }  // namespace
 
