@@ -17,7 +17,7 @@ find_package(fanuc_driver 3 REQUIRED)
 target_link_libraries(my_app PRIVATE fanuc_driver::fanuc_driver)
 ```
 
-项目要求支持 `std::expected` 的 C++23 编译器与标准库，构建时需要 Boost 1.74+
+项目要求支持 `std::expected` 的 C++23 编译器与标准库，构建时需要 Boost 1.83+
 开发头文件。TCP 使用 `boost::asio`（C++23 尚无 `std::asio`），Boost 是私有实现依赖，
 安装包使用者不需要在公开 API 中包含或链接 Boost。构建示例和测试的项目命令见仓库根目录的 README。
 

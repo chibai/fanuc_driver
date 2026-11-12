@@ -506,6 +506,44 @@ TEST(FanucDriver, AsyncInstructionsCompleteWithoutPollingTheDriver)
   ASSERT_NO_THROW(controller.finish());
 }
 
+TEST(FanucDriver, AsyncWindowWakesWriterForEachReleasedSlot)
+{
+  std::vector<Exchange> exchanges(8, { "FRC_WaitTime", "" });
+  exchanges.back().response = R"({"Instruction":"FRC_WaitTime","ErrorID":0,"SequenceID":1})";
+  exchanges.back().delay = 20ms;
+  exchanges.push_back({ R"("SequenceID":9)", R"({"Instruction":"FRC_WaitTime","ErrorID":0,"SequenceID":2})", 20ms });
+  std::string remaining;
+  for (int sequence = 3; sequence <= 10; ++sequence)
+    remaining += R"({"Instruction":"FRC_WaitTime","ErrorID":0,"SequenceID":)" + std::to_string(sequence) + "}\r\n";
+  exchanges.push_back({ R"("SequenceID":10)", std::move(remaining) });
+  Controller controller(std::move(exchanges));
+  FanucRmiDriver driver("127.0.0.1", controller.port());
+  ASSERT_TRUE(driver.connect().ok());
+  std::vector<FanucRmiDriver::InstructionHandle> handles;
+  for (int i = 0; i < 10; ++i)
+    handles.push_back(driver.sendInstructionAsync(rmi::WaitForTimePacket::Request{}));
+  for (const auto& handle : handles)
+  {
+    ASSERT_EQ(handle.result.wait_for(1s), std::future_status::ready);
+    EXPECT_TRUE(handle.result.get().ok());
+  }
+  EXPECT_EQ(driver.getRemainingBufferSize(), 8);
+  ASSERT_NO_THROW(controller.finish());
+  EXPECT_EQ(controller.requests().size(), 10);
+}
+
+TEST(FanucDriver, IdleSessionDestructionDrainsSuspendedCoroutines)
+{
+  Controller controller({ { "FRC_Reset", R"({"Command":"FRC_Reset","ErrorID":0})" } });
+  auto driver = std::make_unique<FanucRmiDriver>("127.0.0.1", controller.port());
+  ASSERT_TRUE(driver->connect().ok());
+  ASSERT_TRUE(driver->reset().ok());
+  const auto start = std::chrono::steady_clock::now();
+  driver.reset();
+  EXPECT_LT(std::chrono::steady_clock::now() - start, 1s);
+  ASSERT_NO_THROW(controller.finish());
+}
+
 TEST(FanucDriver, AsyncInstructionsRejectMismatchedReplyNames)
 {
   Controller controller({

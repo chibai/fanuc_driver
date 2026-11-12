@@ -52,9 +52,11 @@ RMI 协议包、运动和扩展接口现仅供内部实现使用，不再是公�
 ## 构建
 
 需要支持 C++23（含 `std::expected`）的编译器与标准库，例如 GCC 13+、
-CMake 3.22+、Boost 1.74+ 开发头文件及 nlohmann/json 3.11+。运行环境需有 RMI 功能的控制器。
+CMake 3.22+、Boost 1.83+ 开发头文件及 nlohmann/json 3.11+。运行环境需有 RMI 功能的控制器。
 网络使用 Boost.Asio 和 nlohmann/json；不再依赖 reflect-cpp、sockpp、Eigen 或 YAML。
 C++23 不包含 `std::asio`；本库采用 `boost::asio`，且不在公开头文件中暴露 Boost 类型。
+内部通信使用 `co_spawn` / `awaitable` 协程和 `as_tuple(use_awaitable)` 显式处理网络错误；
+设计依据及 RMI 超时、窗口和生命周期约束见[架构说明](docs/architecture.md#asio-协程设计)。
 
 ```bash
 # Ubuntu / Debian
