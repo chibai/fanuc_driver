@@ -31,6 +31,56 @@ JSON 映射、分帧、序列化声明及错误适配头文件。
 运动、推送或扩展参数接口；这些能力不因移动头文件而伪装成通用 API。
 FANUC 实现使用 RMI，不依赖或模拟 FOCAS。
 
+### 同步命令与连续异步运动
+
+内部 `FanucRmiDriver::sendInstructionAsync(request)` 接收带 `Instruction`、
+`SequenceID` 的请求，复制请求并返回 `InstructionHandle`，包含分配的 `sequence_id`
+和 `std::shared_future<Response<rmi::InstructionResponse>>`。调用不等待网络写入或
+控制器回复；每条结果独立保存，后续成功不会覆盖前面的错误，也不需要轮询驱动来推进接收。
+这仍是内部协议接口，不改变安装后的 `Fanuc_driver` 或 `Robot_driver` 契约。
+
+```cpp
+auto first = driver.sendInstructionAsync(first_request);
+auto second = driver.sendInstructionAsync(second_request);
+
+do_other_work();
+
+if (first.result.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
+{
+  const auto& result = first.result.get();
+  // 检查 result.status；控制器回复存在时，data 保留原始 ErrorID 和 SequenceID。
+}
+const auto& second_result = second.result.get();
+```
+
+后台单线程持续运行 `io_context`，串行操作 socket、写队列和待回复表，因此无需
+额外的 `strand`；不可直接从其他线程操作这些状态。仅允许一个 `async_write`
+在途，缓冲区由队列项持有直到完成；读循环持续分帧，按 `SequenceID` 分发运动回复。
+沿用现有 RMI 的 8 条在途窗口，超出窗口的指令在本地排队，收到对应回复后再发送。
+本地队列没有容量上限，长轨迹应由调用者分批提交，不能无限制生产。
+`getRemainingBufferSize()` 计入尚未收到回复的在途和本地排队指令，最小返回 0。
+普通同步命令可绕过被窗口阻塞的运动，避免状态查询或 Abort 等控制操作饿死。
+这些命令可能先于尚未发送的运动到达控制器，因此同步查询不是运动完成屏障。
+
+`sendJointMotion()`、带序号的 `sendRMIPacket()` 和同步 `programCall()` 复用
+上述提交与结果等待机制，等待期间不占用运动提交锁。无序号的同步命令使用独立命令锁
+串行执行完整请求/回复事务，仍可与多个异步运动交错。
+旧的 `sendRMIPacketNonBlocking()` 保留兼容行为：等待写入但不等待回复，
+窗口满时也可能等待空位；需要真正不等待的调用应迁移到 `sendInstructionAsync()`。
+`getLastInstructionResponse()` 仅适合进度显示，不用于判断整批成功；整批成功必须检查
+每个句柄的 `status.ok()`。
+
+future 就绪表示收到该条 RMI 回复或确定无法继续追踪，不额外承诺机器人已精确到位。
+应按控制器版本和轨迹终止模式解释 RMI 回复，不能把 TCP 写入完成视为运动完成。
+`wait_for()` 超时只停止调用者等待，不取消运动，也不触发自动重发。
+断线、销毁和会话替换会以连接错误结束未完成句柄；系统故障、Terminate 和成功的
+Abort 会结束受影响任务并阻止后续指令，需成功初始化后才能重新提交。
+已完成的句柄结果不会因此改变。初始化会拒绝仍有未完成指令的会话，
+成功后才重置序号；旧句柄仍保留原结果。
+调用者必须保证驱动生命周期覆盖所有成员函数调用，不能与析构并发使用驱动。
+普通同步命令超时后，迟到回复仍可能到达；无序号协议不能可靠区分同类型重试，
+应恢复会话后再重试，而不是把超时当作取消。
+
 仅 `.cpp` 和针对内部行为的测试可以包含 `src` 下的头文件。
 内部包含路径只对测试目标以 `PRIVATE` 设置；安装规则只复制 `include/`，
 不发布 `src` 或内部 `detail`。不在 `include` 和 `src` 中重复存放同一份内部头文件。

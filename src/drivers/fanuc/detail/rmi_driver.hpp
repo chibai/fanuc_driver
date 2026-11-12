@@ -7,21 +7,45 @@
 
 #include <cstdint>
 #include <expected>
+#include <future>
 #include <list>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <variant>
 #include <vector>
 
-#include "robot_driver/core/robot.hpp"
 #include "packets.hpp"
+#include "response.hpp"
+#include "robot_driver/core/robot.hpp"
+#include "serialization.hpp"
 #include "types.hpp"
 
 class FanucRmiDriver final : public Robot_driver
 {
 public:
+  struct InstructionHandle
+  {
+    int sequence_id = 0;
+    std::shared_future<Response<rmi::InstructionResponse>> result;
+  };
+
+  template <typename Request>
+    requires requires(Request request) {
+      request.Instruction;
+      request.SequenceID;
+    }
+  InstructionHandle sendInstructionAsync(Request request)
+  {
+    std::scoped_lock lock(motion_mutex_);
+    request.SequenceID = getSequenceNumber();
+    return enqueueInstruction(request.SequenceID, request.Instruction, rmi::ToJSON(request),
+                              std::is_same_v<Request, rmi::ProgramCallPacket::Request>);
+  }
+
   explicit FanucRmiDriver(const std::string& robot_ip_address, uint16_t rmi_port = 16001);
 
   ~FanucRmiDriver() override;
@@ -219,6 +243,24 @@ private:
   struct PConnectionImpl;
 
   int32_t getSequenceNumber();
+  InstructionHandle enqueueInstruction(int sequence_id, std::string instruction, std::string json, bool program_call);
+
+  template <typename T>
+  T waitInstruction(const InstructionHandle& handle, std::optional<double> timeout);
+
+  template <typename T, typename Operation>
+  Response<T> commandResponse(Operation&& operation)
+  {
+    std::scoped_lock lock(command_mutex_);
+    return rmi::detail::captureResponse<T>(std::forward<Operation>(operation));
+  }
+
+  template <typename T, typename Operation>
+  std::expected<T, ResponseStatus> commandExpected(Operation&& operation)
+  {
+    std::scoped_lock lock(command_mutex_);
+    return rmi::detail::captureExpected<T>(std::forward<Operation>(operation));
+  }
 
   template <typename T>
   T getResponsePacket(std::optional<double> timeout_optional, const std::string& error_message_prefix,
@@ -245,6 +287,7 @@ private:
   std::list<std::string> json_responses_;
   mutable std::mutex mutex_;
   mutable std::mutex motion_mutex_;
+  mutable std::mutex command_mutex_;
 
   const std::unique_ptr<PConnectionImpl> connection_impl_;
 

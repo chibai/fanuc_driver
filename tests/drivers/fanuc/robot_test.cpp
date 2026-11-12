@@ -1,8 +1,10 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <condition_variable>
 #include <exception>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -31,10 +33,10 @@ struct Exchange
 class Controller
 {
 public:
-  explicit Controller(std::vector<Exchange> exchanges, std::string handshake_trailer = {})
+  explicit Controller(std::vector<Exchange> exchanges, std::string handshake_trailer = {}, bool refuse_session = false)
     : listener_(context_, { boost::asio::ip::make_address("127.0.0.1"), 0 })
     , session_(context_, { boost::asio::ip::make_address("127.0.0.1"), 0 })
-    , worker_([this, exchanges = std::move(exchanges),
+    , worker_([this, exchanges = std::move(exchanges), refuse_session,
                handshake_trailer = std::move(handshake_trailer)](std::stop_token stop) {
       try
       {
@@ -42,15 +44,24 @@ public:
         const auto request = readLine(handshake);
         if (request != R"({"Communication":"FRC_Connect"})")
           throw std::runtime_error("Expected standard RMI handshake, got: " + request);
+        const auto session_port = session_.local_endpoint().port();
+        if (refuse_session)
+          session_.close();
         writeBytes(handshake, R"({"Communication":"FRC_Connect","ErrorID":0,"PortNumber":)" +
-                                  std::to_string(session_.local_endpoint().port()) +
-                                  R"(,"MajorVersion":3,"MinorVersion":1})" + "\r\n" + handshake_trailer);
+                                  std::to_string(session_port) + R"(,"MajorVersion":3,"MinorVersion":1})" + "\r\n" +
+                                  handshake_trailer);
         handshake.close();
+        if (refuse_session)
+          return;
         auto connection = accept(session_, stop);
         for (const auto& exchange : exchanges)
         {
           auto request = readLine(connection);
-          requests_.push_back(request);
+          {
+            std::scoped_lock lock(request_mutex_);
+            requests_.push_back(request);
+          }
+          request_changed_.notify_all();
           if (request.find(exchange.command) == std::string::npos)
             throw std::runtime_error("Unexpected RMI request: " + request);
           std::this_thread::sleep_for(exchange.delay);
@@ -96,6 +107,12 @@ public:
   const std::vector<std::string>& requests() const
   {
     return requests_;
+  }
+
+  bool waitForRequests(std::size_t count)
+  {
+    std::unique_lock lock(request_mutex_);
+    return request_changed_.wait_for(lock, 1s, [&]() { return requests_.size() >= count; });
   }
 
 private:
@@ -158,6 +175,8 @@ private:
   boost::asio::ip::tcp::acceptor listener_;
   boost::asio::ip::tcp::acceptor session_;
   std::vector<std::string> requests_;
+  std::mutex request_mutex_;
+  std::condition_variable request_changed_;
   std::exception_ptr error_;
   std::jthread worker_;
 };
@@ -410,6 +429,277 @@ TEST(FanucDriver, MotionRepliesAndSequenceTracking)
   EXPECT_EQ(driver.getRemainingBufferSize(), 8);
   ASSERT_NO_THROW(controller.finish());
   EXPECT_NE(controller.requests()[4].find(R"("ParamValue1":7)"), std::string::npos);
+}
+
+TEST(FanucDriver, AsyncInstructionsPipelineAndRetainEveryResult)
+{
+  Controller controller({
+      { "FRC_WaitTime", "" },
+      { "FRC_WaitTime", "" },
+      { "FRC_WaitTime", R"({"Instruction":"FRC_WaitTime","ErrorID":0,"SequenceID":3})"
+                        "\r\n"
+                        R"({"Instruction":"FRC_WaitTime","ErrorID":2556959,"SequenceID":1})" },
+      { "FRC_Reset", R"({"Instruction":"FRC_WaitTime","ErrorID":0,"SequenceID":2})"
+                     "\r\n"
+                     R"({"Command":"FRC_Reset","ErrorID":0})" },
+  });
+  FanucRmiDriver driver("127.0.0.1", controller.port());
+  ASSERT_TRUE(driver.connect().ok());
+  const auto first = driver.sendInstructionAsync(rmi::WaitForTimePacket::Request{});
+  const auto second = driver.sendInstructionAsync(rmi::WaitForTimePacket::Request{});
+  const auto third = driver.sendInstructionAsync(rmi::WaitForTimePacket::Request{});
+  EXPECT_EQ(first.sequence_id, 1);
+  EXPECT_EQ(second.sequence_id, 2);
+  EXPECT_EQ(third.sequence_id, 3);
+  EXPECT_EQ(second.result.wait_for(10ms), std::future_status::timeout);
+  ASSERT_TRUE(driver.reset().ok());
+  ASSERT_EQ(first.result.wait_for(1s), std::future_status::ready);
+  ASSERT_EQ(second.result.wait_for(1s), std::future_status::ready);
+  ASSERT_EQ(third.result.wait_for(1s), std::future_status::ready);
+  EXPECT_EQ(first.result.get().status.value, ResponseCode::CUSTOM_ERROR);
+  EXPECT_EQ(first.result.get().data->ErrorID, 2556959);
+  EXPECT_TRUE(second.result.get().ok());
+  EXPECT_TRUE(third.result.get().ok());
+  EXPECT_EQ(first.result.get().data->SequenceID, 1);
+  EXPECT_EQ(driver.getLastInstructionResponse()->SequenceID, 3);
+  EXPECT_EQ(driver.getRemainingBufferSize(), 8);
+  ASSERT_NO_THROW(controller.finish());
+}
+
+TEST(FanucDriver, AsyncWindowLimitsInstructionsButAllowsSynchronousCommands)
+{
+  std::vector<Exchange> exchanges(8, { "FRC_WaitTime", "" });
+  std::string responses;
+  for (int sequence = 8; sequence >= 1; --sequence)
+    responses += R"({"Instruction":"FRC_WaitTime","ErrorID":0,"SequenceID":)" + std::to_string(sequence) + "}\r\n";
+  exchanges.push_back({ "FRC_Reset", responses + R"({"Command":"FRC_Reset","ErrorID":0})" });
+  exchanges.push_back({ "FRC_WaitTime", R"({"Instruction":"FRC_WaitTime","ErrorID":0,"SequenceID":9})" });
+  Controller controller(std::move(exchanges));
+  FanucRmiDriver driver("127.0.0.1", controller.port());
+  ASSERT_TRUE(driver.connect().ok());
+  std::vector<FanucRmiDriver::InstructionHandle> handles;
+  for (int i = 0; i < 9; ++i)
+    handles.push_back(driver.sendInstructionAsync(rmi::WaitForTimePacket::Request{}));
+  EXPECT_EQ(driver.getRemainingBufferSize(), 0);
+  // The ninth motion must stay queued while the command bypasses the full window.
+  ASSERT_TRUE(driver.reset().ok());
+  for (const auto& handle : handles)
+  {
+    ASSERT_EQ(handle.result.wait_for(1s), std::future_status::ready);
+    EXPECT_TRUE(handle.result.get().ok());
+  }
+  ASSERT_NO_THROW(controller.finish());
+  EXPECT_NE(controller.requests()[8].find("FRC_Reset"), std::string::npos);
+  EXPECT_NE(controller.requests()[9].find(R"("SequenceID":9)"), std::string::npos);
+}
+
+TEST(FanucDriver, AsyncInstructionsCompleteWithoutPollingTheDriver)
+{
+  Controller controller({
+      { "FRC_WaitTime", R"({"Instruction":"FRC_WaitTime","ErrorID":0,"SequenceID":1})", 20ms },
+  });
+  FanucRmiDriver driver("127.0.0.1", controller.port());
+  ASSERT_TRUE(driver.connect().ok());
+  const auto handle = driver.sendInstructionAsync(rmi::WaitForTimePacket::Request{});
+  ASSERT_EQ(handle.result.wait_for(1s), std::future_status::ready);
+  EXPECT_TRUE(handle.result.get().ok());
+  ASSERT_NO_THROW(controller.finish());
+}
+
+TEST(FanucDriver, AsyncInstructionsRejectMismatchedReplyNames)
+{
+  Controller controller({
+      { "FRC_WaitTime", R"({"Instruction":"FRC_LinearMotion","ErrorID":0,"SequenceID":1})" },
+  });
+  FanucRmiDriver driver("127.0.0.1", controller.port());
+  ASSERT_TRUE(driver.connect().ok());
+  const auto handle = driver.sendInstructionAsync(rmi::WaitForTimePacket::Request{});
+  ASSERT_EQ(handle.result.wait_for(1s), std::future_status::ready);
+  EXPECT_EQ(handle.result.get().status.value, ResponseCode::SERVER_ERR);
+  EXPECT_FALSE(handle.result.get().data);
+  ASSERT_NO_THROW(controller.finish());
+}
+
+TEST(FanucDriver, AsyncInstructionsReportUnknownInstructionReplies)
+{
+  Controller controller({
+      { "FRC_WaitTime", R"({"Command":"Unknown","ErrorID":2556948,"SequenceID":1})" },
+      { "FRC_WaitTime", R"({"Instruction":"FRC_WaitTime","ErrorID":0,"SequenceID":2})" },
+  });
+  FanucRmiDriver driver("127.0.0.1", controller.port());
+  ASSERT_TRUE(driver.connect().ok());
+  const auto rejected = driver.sendInstructionAsync(rmi::WaitForTimePacket::Request{});
+  const auto accepted = driver.sendInstructionAsync(rmi::WaitForTimePacket::Request{});
+  ASSERT_EQ(rejected.result.wait_for(1s), std::future_status::ready);
+  ASSERT_EQ(accepted.result.wait_for(1s), std::future_status::ready);
+  EXPECT_EQ(rejected.result.get().status.value, ResponseCode::CUSTOM_ERROR);
+  EXPECT_NE(rejected.result.get().status.detail.find("Invalid RMI Instruction"), std::string::npos);
+  EXPECT_TRUE(accepted.result.get().ok());
+  EXPECT_EQ(driver.getRemainingBufferSize(), 8);
+  EXPECT_TRUE(driver.checkUnknownPacket());
+  ASSERT_NO_THROW(controller.finish());
+}
+
+TEST(FanucDriver, SessionFaultsTerminatePendingAndQueuedInstructions)
+{
+  for (const auto& fault :
+       { R"({"Communication":"FRC_SystemFault","SequenceID":8})", R"({"Communication":"FRC_Terminate"})" })
+  {
+    std::vector<Exchange> exchanges(8, { "FRC_WaitTime", "" });
+    exchanges.back().response = fault;
+    Controller controller(std::move(exchanges));
+    FanucRmiDriver driver("127.0.0.1", controller.port());
+    ASSERT_TRUE(driver.connect().ok());
+    std::vector<FanucRmiDriver::InstructionHandle> handles;
+    for (int i = 0; i < 9; ++i)
+      handles.push_back(driver.sendInstructionAsync(rmi::WaitForTimePacket::Request{}));
+    for (const auto& handle : handles)
+    {
+      ASSERT_EQ(handle.result.wait_for(1s), std::future_status::ready);
+      EXPECT_EQ(handle.result.get().status.value, ResponseCode::CONTROLLER_ERROR);
+    }
+    ASSERT_NO_THROW(controller.finish());
+    EXPECT_EQ(controller.requests().size(), 8);
+  }
+}
+
+TEST(FanucDriver, FailedSessionSwitchDoesNotLeaveCallsWaitingForAnIoThread)
+{
+  Controller controller({}, {}, true);
+  FanucRmiDriver driver("127.0.0.1", controller.port());
+  EXPECT_EQ(driver.connect().status.value, ResponseCode::CONNECTION_ERROR);
+  EXPECT_EQ(driver.reset().status.value, ResponseCode::CONNECTION_ERROR);
+  EXPECT_EQ(driver.initializeRemoteMotion().status.value, ResponseCode::CONNECTION_ERROR);
+  const auto handle = driver.sendInstructionAsync(rmi::WaitForTimePacket::Request{});
+  ASSERT_EQ(handle.result.wait_for(1s), std::future_status::ready);
+  EXPECT_EQ(handle.result.get().status.value, ResponseCode::CONNECTION_ERROR);
+  EXPECT_THROW(driver.getRemainingBufferSize(), std::runtime_error);
+  ASSERT_NO_THROW(controller.finish());
+}
+
+TEST(FanucDriver, AsyncInstructionsReportDisconnectForEveryHandle)
+{
+  Controller controller({ { "FRC_WaitTime", "", 0ms, 0, true } });
+  FanucRmiDriver driver("127.0.0.1", controller.port());
+  ASSERT_TRUE(driver.connect().ok());
+  std::vector<FanucRmiDriver::InstructionHandle> handles;
+  for (int i = 0; i < 10; ++i)
+    handles.push_back(driver.sendInstructionAsync(rmi::WaitForTimePacket::Request{}));
+  for (const auto& handle : handles)
+  {
+    ASSERT_EQ(handle.result.wait_for(1s), std::future_status::ready);
+    EXPECT_EQ(handle.result.get().status.value, ResponseCode::CONNECTION_ERROR);
+  }
+  ASSERT_NO_THROW(controller.finish());
+}
+
+TEST(FanucDriver, AsyncHandlesSurviveDriverDestruction)
+{
+  Controller controller(std::vector<Exchange>(8, { "FRC_WaitTime", "" }));
+  std::vector<FanucRmiDriver::InstructionHandle> handles;
+  {
+    FanucRmiDriver driver("127.0.0.1", controller.port());
+    ASSERT_TRUE(driver.connect().ok());
+    for (int i = 0; i < 9; ++i)
+      handles.push_back(driver.sendInstructionAsync(rmi::WaitForTimePacket::Request{}));
+    ASSERT_TRUE(controller.waitForRequests(8));
+  }
+  for (const auto& handle : handles)
+  {
+    ASSERT_EQ(handle.result.wait_for(1s), std::future_status::ready);
+    EXPECT_EQ(handle.result.get().status.value, ResponseCode::CONNECTION_ERROR);
+  }
+  ASSERT_NO_THROW(controller.finish());
+}
+
+TEST(FanucDriver, SynchronousMotionDoesNotBlockAsyncSubmissionsOrCommands)
+{
+  Controller controller({
+      { "FRC_WaitTime", "" },
+      { "FRC_Reset", R"({"Command":"FRC_Reset","ErrorID":0})" },
+      { "FRC_WaitTime", R"({"Instruction":"FRC_WaitTime","ErrorID":0,"SequenceID":2})"
+                        "\r\n"
+                        R"({"Instruction":"FRC_WaitTime","ErrorID":0,"SequenceID":1})" },
+  });
+  FanucRmiDriver driver("127.0.0.1", controller.port());
+  ASSERT_TRUE(driver.connect().ok());
+  auto synchronous = std::async(std::launch::async, [&]() {
+    rmi::WaitForTimePacket::Request request{};
+    return driver.sendRMIPacket<rmi::WaitForTimePacket>(request);
+  });
+  ASSERT_TRUE(controller.waitForRequests(1));
+  ASSERT_TRUE(driver.reset().ok());
+  const auto asynchronous = driver.sendInstructionAsync(rmi::WaitForTimePacket::Request{});
+  ASSERT_EQ(synchronous.wait_for(1s), std::future_status::ready);
+  EXPECT_TRUE(synchronous.get().ok());
+  ASSERT_EQ(asynchronous.result.wait_for(1s), std::future_status::ready);
+  EXPECT_TRUE(asynchronous.result.get().ok());
+  ASSERT_NO_THROW(controller.finish());
+}
+
+TEST(FanucDriver, InitializeRejectsOutstandingInstructionsAndResetsAfterAbort)
+{
+  Controller controller({
+      { "FRC_WaitTime", "" },
+      { "FRC_Abort", R"({"Command":"FRC_Abort","ErrorID":0})" },
+      { "FRC_Initialize", R"({"Command":"FRC_Initialize","ErrorID":0})" },
+      { "FRC_WaitTime", R"({"Instruction":"FRC_WaitTime","ErrorID":0,"SequenceID":1})" },
+  });
+  FanucRmiDriver driver("127.0.0.1", controller.port());
+  ASSERT_TRUE(driver.connect().ok());
+  const auto old = driver.sendInstructionAsync(rmi::WaitForTimePacket::Request{});
+  EXPECT_EQ(driver.initializeRemoteMotion().status.value, ResponseCode::INVALID_PARAMETER);
+  ASSERT_TRUE(driver.abort().ok());
+  ASSERT_TRUE(driver.initializeRemoteMotion().ok());
+  const auto next = driver.sendInstructionAsync(rmi::WaitForTimePacket::Request{});
+  EXPECT_EQ(next.sequence_id, 1);
+  ASSERT_EQ(next.result.wait_for(1s), std::future_status::ready);
+  ASSERT_EQ(old.result.wait_for(1s), std::future_status::ready);
+  EXPECT_TRUE(next.result.get().ok());
+  EXPECT_EQ(old.result.get().status.value, ResponseCode::CONTROLLER_ERROR);
+  ASSERT_NO_THROW(controller.finish());
+}
+
+TEST(FanucDriver, AbortTerminatesPendingAndQueuedInstructions)
+{
+  std::vector<Exchange> exchanges(8, { "FRC_WaitTime", "" });
+  exchanges.push_back({ "FRC_Abort", R"({"Command":"FRC_Abort","ErrorID":0})" });
+  Controller controller(std::move(exchanges));
+  FanucRmiDriver driver("127.0.0.1", controller.port());
+  ASSERT_TRUE(driver.connect().ok());
+  std::vector<FanucRmiDriver::InstructionHandle> handles;
+  for (int i = 0; i < 9; ++i)
+    handles.push_back(driver.sendInstructionAsync(rmi::WaitForTimePacket::Request{}));
+  ASSERT_TRUE(driver.abort().ok());
+  for (const auto& handle : handles)
+  {
+    ASSERT_EQ(handle.result.wait_for(1s), std::future_status::ready);
+    EXPECT_EQ(handle.result.get().status.value, ResponseCode::CONTROLLER_ERROR);
+  }
+  const auto rejected = driver.sendInstructionAsync(rmi::WaitForTimePacket::Request{});
+  ASSERT_EQ(rejected.result.wait_for(1s), std::future_status::ready);
+  EXPECT_EQ(rejected.result.get().status.value, ResponseCode::CONTROLLER_ERROR);
+  ASSERT_NO_THROW(controller.finish());
+  EXPECT_EQ(controller.requests().size(), 9);
+}
+
+TEST(FanucDriver, SynchronousInstructionTimeoutDoesNotLoseItsReply)
+{
+  Controller controller({
+      { "FRC_WaitTime", "" },
+      { "FRC_WaitTime", R"({"Instruction":"FRC_WaitTime","ErrorID":0,"SequenceID":2})"
+                        "\r\n"
+                        R"({"Instruction":"FRC_WaitTime","ErrorID":0,"SequenceID":1})" },
+  });
+  FanucRmiDriver driver("127.0.0.1", controller.port());
+  ASSERT_TRUE(driver.connect().ok());
+  rmi::WaitForTimePacket::Request request{};
+  EXPECT_EQ(driver.sendRMIPacket<rmi::WaitForTimePacket>(request, 0.01).status.value, ResponseCode::WAITING_TIMEOUT);
+  const auto next = driver.sendInstructionAsync(request);
+  ASSERT_EQ(next.result.wait_for(1s), std::future_status::ready);
+  EXPECT_EQ(next.result.get().data->SequenceID, 2);
+  EXPECT_TRUE(next.result.get().ok());
+  ASSERT_NO_THROW(controller.finish());
 }
 
 TEST(FanucDriver, ControllerErrorsAndTimeoutsAreReported)
