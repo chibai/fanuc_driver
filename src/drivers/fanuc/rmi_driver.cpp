@@ -13,14 +13,19 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <deque>
 #include <expected>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <mutex>
 #include <ranges>
 #include <span>
 #include <sstream>
 #include <system_error>
+#include <thread>
+#include <unordered_map>
 #include <utility>
 
 #include <boost/asio.hpp>
@@ -157,16 +162,31 @@ void addCallArguments(ProgramCallPacket::Request& packet, const std::span<const 
 struct FanucRmiDriver::PConnectionImpl
 {
   using Clock = std::chrono::steady_clock;
-  using IOResult = std::expected<std::size_t, boost::system::error_code>;
+  using InstructionResult = Response<InstructionResponse>;
+
+  struct Write
+  {
+    std::string bytes;
+    std::optional<int> sequence;
+    std::string instruction;
+    std::promise<ResponseStatus> written;
+  };
 
   PConnectionImpl(const std::string& robot_ip_address, const uint16_t robot_port)
   {
     createNewConnection(robot_ip_address, robot_port);
   }
 
+  ~PConnectionImpl()
+  {
+    stop();
+  }
+
   template <typename T>
   void write(const T& value, const std::string& encoding = "UTF-8")
   {
+    if (!worker_.joinable())
+      throw rmi::detail::ResponseError({ ResponseCode::CONNECTION_ERROR, "RMI TCP session is not running." });
     const std::string json_string = [&]() {
       std::string json_str = ToJSON(value) + kEndChars;
       if constexpr (std::is_same_v<T, ProgramCallPacket::Request>)
@@ -178,23 +198,52 @@ struct FanucRmiDriver::PConnectionImpl
       }
       return json_str;
     }();
-    std::scoped_lock lock(mutex_);
-    std::optional<IOResult> result;
-    boost::asio::async_write(socket_, boost::asio::buffer(json_string),
-                             [&result](const boost::system::error_code error, const std::size_t size) {
-                               result = error ? IOResult(std::unexpected(error)) : IOResult(size);
-                             });
-    context_.restart();
-    while (!result)
-      context_.run_one();
-    if (!*result)
-      throw rmi::detail::ResponseError({ ResponseCode::CONNECTION_ERROR,
-                                         "Failed to write to RMI TCP connection: " + result->error().message() });
+    auto operation = std::make_shared<Write>();
+    operation->bytes = json_string;
+    if constexpr (requires {
+                    value.Instruction;
+                    value.SequenceID;
+                  })
+    {
+      operation->sequence = value.SequenceID;
+      operation->instruction = value.Instruction;
+    }
+    auto written = operation->written.get_future();
+    boost::asio::post(context_, [this, operation]() { enqueue(operation); });
+    const auto status = written.get();
+    if (!status.ok())
+      throw rmi::detail::ResponseError(status);
+  }
+
+  InstructionHandle submit(int sequence, std::string instruction, std::string json)
+  {
+    auto promise = std::make_shared<std::promise<InstructionResult>>();
+    auto result = promise->get_future().share();
+    if (!worker_.joinable())
+    {
+      promise->set_value({ { ResponseCode::CONNECTION_ERROR, "RMI TCP session is not running." }, std::nullopt });
+      return { sequence, std::move(result) };
+    }
+    auto operation = std::make_shared<Write>();
+    operation->bytes = std::move(json) + kEndChars;
+    operation->sequence = sequence;
+    operation->instruction = std::move(instruction);
+    boost::asio::post(context_, [this, operation, promise, sequence]() {
+      if (failure_)
+      {
+        promise->set_value({ *failure_, std::nullopt });
+        return;
+      }
+      pending_.emplace(sequence, promise);
+      enqueue(operation);
+    });
+    return { sequence, std::move(result) };
   }
 
   void createNewConnection(const std::string& robot_ip_address, const uint16_t robot_port)
   {
-    std::scoped_lock lock(mutex_);
+    stop();
+    context_.restart();
     boost::asio::ip::tcp::resolver resolver(context_);
     boost::system::error_code error;
     const auto endpoints = resolver.resolve(robot_ip_address, std::to_string(robot_port), error);
@@ -202,89 +251,309 @@ struct FanucRmiDriver::PConnectionImpl
       throw rmi::detail::ResponseError({ ResponseCode::CONNECTION_ERROR,
                                          "Failed to resolve RMI server " + robot_ip_address + ": " + error.message() });
 
-    // Drain cancellation handlers before replacing buffers used by the old session.
-    if (socket_.is_open())
-    {
-      socket_.close(error);
-      if (error)
-        throw rmi::detail::ResponseError(
-            { ResponseCode::CONNECTION_ERROR, "Failed to close RMI TCP connection: " + error.message() });
-    }
-    context_.restart();
-    context_.run();
-    read_result_.reset();
-    read_pending_ = false;
-    line_buffer_ = {};
-
     boost::asio::connect(socket_, endpoints, error);
     if (error)
-      throw rmi::detail::ResponseError({ ResponseCode::CONNECTION_ERROR,
-                                         "Failed to create TCP connection at " + robot_ip_address + ":" +
-                                             std::to_string(robot_port) + ": " + error.message() });
+      throw rmi::detail::ResponseError(
+          { ResponseCode::CONNECTION_ERROR, "Failed to create TCP connection at " + robot_ip_address + ":" +
+                                                std::to_string(robot_port) + ": " + error.message() });
+    failure_.reset();
+    instruction_failure_.reset();
+    {
+      std::scoped_lock lock(mutex_);
+      incoming_.clear();
+      read_failure_.reset();
+      last_instruction_.reset();
+      outstanding_ = 0;
+    }
+    line_buffer_ = {};
+    work_.emplace(boost::asio::make_work_guard(context_));
+    startRead();
+    worker_ = std::thread([this]() { context_.run(); });
   }
 
   std::vector<std::string> read()
   {
     std::scoped_lock lock(mutex_);
-    std::vector<std::string> lines;
-    startRead();
-    context_.restart();
-    context_.poll();
-    while (read_result_)
-    {
-      if (!*read_result_)
-      {
-        // Deliver complete frames before reporting a following EOF on the next call.
-        if (!lines.empty())
-          return lines;
-        if (read_result_->error() == boost::asio::error::eof)
-          throw rmi::detail::ResponseError(
-              { ResponseCode::CONNECTION_ERROR, "RMI TCP connection was closed by the controller." });
-        throw rmi::detail::ResponseError({ ResponseCode::CONNECTION_ERROR,
-                                           "Failed to read from RMI TCP connection: " + read_result_->error().message() });
-      }
-      auto frames = line_buffer_.append(std::string_view(read_buffer_.data(), read_result_->value()));
-      lines.insert(lines.end(), std::make_move_iterator(frames.begin()), std::make_move_iterator(frames.end()));
-      read_result_.reset();
-      startRead();
-      context_.restart();
-      context_.poll();
-    }
-    return lines;
+    if (incoming_.empty() && read_failure_)
+      throw rmi::detail::ResponseError(*read_failure_);
+    return std::exchange(incoming_, {});
   }
 
   void waitForData(const std::optional<Clock::time_point> deadline)
   {
-    std::scoped_lock lock(mutex_);
-    startRead();
-    if (read_result_)
-      return;
-    context_.restart();
+    std::unique_lock lock(mutex_);
+    const auto ready = [this]() { return !incoming_.empty() || read_failure_.has_value(); };
     if (deadline)
-      context_.run_one_until(*deadline);
+      changed_.wait_until(lock, *deadline, ready);
     else
-      context_.run_one();
+      changed_.wait(lock, ready);
+  }
+
+  std::optional<InstructionResponse> lastInstruction()
+  {
+    std::scoped_lock lock(mutex_);
+    return last_instruction_;
+  }
+
+  int remaining()
+  {
+    if (!worker_.joinable())
+      throw rmi::detail::ResponseError({ ResponseCode::CONNECTION_ERROR, "RMI TCP session is not running." });
+    std::promise<int> promise;
+    auto result = promise.get_future();
+    boost::asio::post(context_, [this, &promise]() {
+      std::scoped_lock lock(mutex_);
+      promise.set_value(std::max(0, 8 - outstanding_));
+    });
+    return result.get();
+  }
+
+  ResponseStatus checkInstructionsIdle()
+  {
+    if (!worker_.joinable())
+      return { ResponseCode::CONNECTION_ERROR, "RMI TCP session is not running." };
+    std::promise<ResponseStatus> promise;
+    auto result = promise.get_future();
+    boost::asio::post(context_, [this, &promise]() {
+      if (failure_)
+      {
+        promise.set_value(*failure_);
+        return;
+      }
+      if (!in_flight_.empty() || !pending_.empty() ||
+          std::ranges::any_of(writes_, [](const auto& operation) { return operation->sequence.has_value(); }))
+      {
+        promise.set_value({ ResponseCode::INVALID_PARAMETER, "Cannot initialize RMI with outstanding instructions." });
+        return;
+      }
+      promise.set_value({});
+    });
+    return result.get();
   }
 
 private:
+  void stop()
+  {
+    if (!worker_.joinable())
+      return;
+    boost::asio::post(context_, [this]() {
+      fail({ ResponseCode::CONNECTION_ERROR, "RMI TCP session ended; instruction completion is unknown." });
+      boost::system::error_code error;
+      socket_.close(error);
+      work_.reset();
+    });
+    worker_.join();
+  }
+
+  void failInstructions(const ResponseStatus& status)
+  {
+    instruction_failure_ = status;
+    for (auto& [sequence, promise] : pending_)
+      promise->set_value({ status, std::nullopt });
+    pending_.clear();
+    in_flight_.clear();
+    for (auto it = writes_.begin(); it != writes_.end();)
+    {
+      if ((*it)->sequence)
+      {
+        (*it)->written.set_value(status);
+        it = writes_.erase(it);
+      }
+      else
+        ++it;
+    }
+    std::scoped_lock lock(mutex_);
+    outstanding_ = 0;
+  }
+
+  void fail(const ResponseStatus& status)
+  {
+    if (failure_)
+      return;
+    failure_ = status;
+    failInstructions(status);
+    for (auto& operation : writes_)
+      operation->written.set_value(status);
+    writes_.clear();
+    {
+      std::scoped_lock lock(mutex_);
+      read_failure_ = status;
+    }
+    changed_.notify_all();
+  }
+
+  void enqueue(const std::shared_ptr<Write>& operation)
+  {
+    if (failure_)
+    {
+      operation->written.set_value(*failure_);
+      return;
+    }
+    if (operation->sequence && instruction_failure_)
+    {
+      if (const auto pending = pending_.find(*operation->sequence); pending != pending_.end())
+      {
+        pending->second->set_value({ *instruction_failure_, std::nullopt });
+        pending_.erase(pending);
+      }
+      operation->written.set_value(*instruction_failure_);
+      return;
+    }
+    writes_.push_back(operation);
+    if (operation->sequence)
+    {
+      std::scoped_lock lock(mutex_);
+      ++outstanding_;
+    }
+    pumpWrites();
+  }
+
+  void pumpWrites()
+  {
+    if (writing_ || failure_)
+      return;
+    const auto next = std::ranges::find_if(writes_, [this](const auto& operation) {
+      return !operation->sequence || in_flight_.size() < 8;
+    });
+    if (next == writes_.end())
+      return;
+    auto operation = *next;
+    writes_.erase(next);
+    if (operation->sequence)
+      in_flight_.emplace(*operation->sequence, operation->instruction);
+    writing_ = true;
+    boost::asio::async_write(socket_, boost::asio::buffer(operation->bytes),
+                             [this, operation](boost::system::error_code error, std::size_t) {
+                               writing_ = false;
+                               ResponseStatus status;
+                               if (error)
+                               {
+                                 status = { ResponseCode::CONNECTION_ERROR,
+                                            "Failed to write to RMI TCP connection: " + error.message() };
+                                 fail(status);
+                               }
+                               operation->written.set_value(status);
+                               pumpWrites();
+                             });
+  }
+
+  void receive(std::string frame, std::vector<std::string>& unhandled)
+  {
+    if (auto instruction = IsInstruction(frame))
+    {
+      const auto sent = in_flight_.find(instruction->SequenceID);
+      const bool acknowledged = sent != in_flight_.end();
+      if (acknowledged)
+      {
+        if (sent->second != instruction->Instruction)
+        {
+          failInstructions({ ResponseCode::SERVER_ERR, "Mismatched RMI instruction response: " + frame });
+          unhandled.push_back(std::move(frame));
+          return;
+        }
+        in_flight_.erase(sent);
+        std::scoped_lock lock(mutex_);
+        --outstanding_;
+      }
+      {
+        std::scoped_lock lock(mutex_);
+        if (!last_instruction_ || last_instruction_->SequenceID < instruction->SequenceID)
+          last_instruction_ = *instruction;
+      }
+      const auto pending = pending_.find(instruction->SequenceID);
+      if (pending != pending_.end() && acknowledged)
+      {
+        InstructionResult result{ {}, *instruction };
+        if (instruction->ErrorID != 0)
+          result.status = { ResponseCode::CUSTOM_ERROR, LookupErrorCode(instruction->ErrorID) };
+        pending->second->set_value(std::move(result));
+        pending_.erase(pending);
+        return;
+      }
+    }
+    if (FromJSON<SystemFaultPacket>(frame) || FromJSON<TimeoutTerminatePacket>(frame))
+      failInstructions({ ResponseCode::CONTROLLER_ERROR, "RMI session fault: " + frame });
+    if (auto unknown = FromJSON<UnknownPacket>(frame); unknown && unknown->SequenceID)
+    {
+      const auto sequence = *unknown->SequenceID;
+      if (in_flight_.erase(sequence))
+      {
+        {
+          std::scoped_lock lock(mutex_);
+          --outstanding_;
+        }
+        if (const auto pending = pending_.find(sequence); pending != pending_.end())
+        {
+          pending->second->set_value(
+              { { ResponseCode::CUSTOM_ERROR, "RMI rejected instruction: " + LookupErrorCode(unknown->ErrorID) },
+                std::nullopt });
+          pending_.erase(pending);
+        }
+      }
+    }
+    if (auto aborted = FromJSON<AbortPacket::Response>(frame); aborted && aborted->ErrorID == 0)
+      failInstructions({ ResponseCode::CONTROLLER_ERROR, "RMI instructions interrupted by Abort." });
+    if (auto disconnected = FromJSON<DisconnectPacket::Response>(frame); disconnected && disconnected->ErrorID == 0)
+      failInstructions({ ResponseCode::CONNECTION_ERROR, "RMI instructions interrupted by Disconnect." });
+    if (auto initialized = FromJSON<InitializePacket::Response>(frame); initialized && initialized->ErrorID == 0)
+    {
+      instruction_failure_.reset();
+      std::scoped_lock lock(mutex_);
+      last_instruction_.reset();
+    }
+    unhandled.push_back(std::move(frame));
+  }
+
   void startRead()
   {
-    if (read_pending_ || read_result_)
-      return;
-    read_pending_ = true;
-    socket_.async_read_some(boost::asio::buffer(read_buffer_),
-                            [this](const boost::system::error_code error, const std::size_t size) {
-                              read_pending_ = false;
-                              read_result_ = error ? IOResult(std::unexpected(error)) : IOResult(size);
-                            });
+    socket_.async_read_some(boost::asio::buffer(read_buffer_), [this](const boost::system::error_code error,
+                                                                      const std::size_t size) {
+      if (error)
+      {
+        fail({ ResponseCode::CONNECTION_ERROR, error == boost::asio::error::eof ?
+                                                   "RMI TCP connection was closed by the controller." :
+                                                   "Failed to read from RMI TCP connection: " + error.message() });
+        return;
+      }
+      try
+      {
+        std::vector<std::string> unhandled;
+        for (auto& frame : line_buffer_.append(std::string_view(read_buffer_.data(), size)))
+          receive(std::move(frame), unhandled);
+        {
+          std::scoped_lock lock(mutex_);
+          incoming_.insert(incoming_.end(), std::make_move_iterator(unhandled.begin()),
+                           std::make_move_iterator(unhandled.end()));
+        }
+        changed_.notify_all();
+        pumpWrites();
+      }
+      catch (const std::exception& exception)
+      {
+        fail({ ResponseCode::SERVER_ERR, "Invalid RMI response: " + std::string(exception.what()) });
+        return;
+      }
+      startRead();
+    });
   }
 
   boost::asio::io_context context_;
   boost::asio::ip::tcp::socket socket_{ context_ };
+  std::optional<boost::asio::executor_work_guard<boost::asio::io_context::executor_type>> work_;
+  std::thread worker_;
   std::mutex mutex_;
+  std::condition_variable changed_;
   std::array<char, 2048> read_buffer_{};
-  bool read_pending_ = false;
-  std::optional<IOResult> read_result_;
+  bool writing_ = false;
+  std::deque<std::shared_ptr<Write>> writes_;
+  std::unordered_map<int, std::string> in_flight_;
+  std::unordered_map<int, std::shared_ptr<std::promise<InstructionResult>>> pending_;
+  std::optional<ResponseStatus> failure_;
+  std::optional<ResponseStatus> instruction_failure_;
+  std::vector<std::string> incoming_;
+  std::optional<ResponseStatus> read_failure_;
+  std::optional<InstructionResponse> last_instruction_;
+  int outstanding_ = 0;
   rmi::detail::LineBuffer line_buffer_;
 };
 
@@ -329,8 +598,8 @@ bool FanucRmiDriver::processInstructionResponse(std::string& json_response)
 
 template <typename T>
 std::optional<T> FanucRmiDriver::checkForPacketInJSONResponses(std::list<std::string>::iterator& it,
-                                                             std::list<std::string>& json_responses,
-                                                             const std::optional<int> expected_sequence_id)
+                                                               std::list<std::string>& json_responses,
+                                                               const std::optional<int> expected_sequence_id)
 {
   std::optional<T> packet_response;
   for (; it != json_responses.end();)
@@ -424,12 +693,15 @@ std::optional<InstructionResponse> FanucRmiDriver::getLastInstructionResponse()
     }
   }
   std::scoped_lock lock(instruction_mutex_);
+  if (auto latest = connection_impl_->lastInstruction();
+      latest && (!last_instruction_response_ || last_instruction_response_->SequenceID < latest->SequenceID))
+    last_instruction_response_ = latest;
   return last_instruction_response_;
 }
 
 template <typename T>
-T FanucRmiDriver::getResponsePacket(const std::optional<double> timeout_optional, const std::string& error_message_prefix,
-                                  std::optional<int> expected_sequence_id)
+T FanucRmiDriver::getResponsePacket(const std::optional<double> timeout_optional,
+                                    const std::string& error_message_prefix, std::optional<int> expected_sequence_id)
 {
   if constexpr (requires(T t) { t.SequenceID; })
   {
@@ -498,7 +770,47 @@ T FanucRmiDriver::getResponsePacket(const std::optional<double> timeout_optional
 
 int32_t FanucRmiDriver::getSequenceNumber()
 {
+  if (sequence_number_ == std::numeric_limits<int32_t>::max())
+    throw rmi::detail::ResponseError(
+        { ResponseCode::INVALID_PARAMETER, "RMI sequence numbers exhausted; initialize a new session." });
   return sequence_number_++;
+}
+
+FanucRmiDriver::InstructionHandle FanucRmiDriver::enqueueInstruction(int sequence_id, std::string instruction,
+                                                                     std::string json, bool program_call)
+{
+  if (program_call && encoding_ != "UTF-8")
+    json = convertEncoding(json, "UTF-8", encoding_.c_str());
+  return connection_impl_->submit(sequence_id, std::move(instruction), std::move(json));
+}
+
+template <typename T>
+T FanucRmiDriver::waitInstruction(const InstructionHandle& handle, std::optional<double> timeout_optional)
+{
+  const double timeout = timeout_optional.value_or(1.0);
+  if (!std::isfinite(timeout))
+    throw std::invalid_argument("RMI response timeout must be finite; use a negative value for unlimited waiting.");
+  if (timeout < 0.0)
+    handle.result.wait();
+  else
+  {
+    const auto now = PConnectionImpl::Clock::now();
+    const auto max_wait = PConnectionImpl::Clock::time_point::max() - now;
+    const auto deadline =
+        timeout >= std::chrono::duration<double>(max_wait).count() ?
+            PConnectionImpl::Clock::time_point::max() :
+            now + std::chrono::duration_cast<PConnectionImpl::Clock::duration>(std::chrono::duration<double>(timeout));
+    if (handle.result.wait_until(deadline) != std::future_status::ready)
+      throw rmi::detail::ResponseError({ ResponseCode::WAITING_TIMEOUT, "Timeout waiting for instruction response." });
+  }
+  const auto& result = handle.result.get();
+  if (!result.status.ok())
+    throw rmi::detail::ResponseError(result.status);
+  T response{};
+  response.Instruction = result.data->Instruction;
+  response.SequenceID = result.data->SequenceID;
+  response.ErrorID = result.data->ErrorID;
+  return response;
 }
 
 ResponseStatus FanucRmiDriver::doConnect(std::optional<double> timeout)
@@ -550,7 +862,7 @@ Response<RobotStatus> FanucRmiDriver::doGetStatus(std::optional<double> timeout)
 }
 
 std::expected<bool, ResponseStatus> FanucRmiDriver::doReadDigitalInputPort(uint16_t port_number,
-                                                                         std::optional<double> timeout)
+                                                                           std::optional<double> timeout)
 {
   const auto response = readDigitalInputPort(port_number, timeout);
   if (!response)
@@ -559,26 +871,34 @@ std::expected<bool, ResponseStatus> FanucRmiDriver::doReadDigitalInputPort(uint1
 }
 
 ResponseStatus FanucRmiDriver::doWriteDigitalOutputPort(uint16_t port_number, bool port_value,
-                                                      std::optional<double> timeout)
+                                                        std::optional<double> timeout)
 {
   return writeDigitalOutputPort(port_number, port_value, timeout).status;
 }
 
 Response<ConnectPacket::Response> FanucRmiDriver::connect(const std::optional<double> timeout)
 {
-  return rmi::detail::captureResponse<ConnectPacket::Response>([&]() {
+  return commandResponse<ConnectPacket::Response>([&]() {
+    std::scoped_lock motion_lock(motion_mutex_);
     connection_impl_->write(ConnectPacket::Request());
     auto connect_response =
         getResponsePacket<ConnectPacket::Response>(timeout, "Failed to connect to RMI server. ", std::nullopt);
     // Recreate a TCP to the new port number provided by the server
     connection_impl_->createNewConnection(robot_ip_address_, connect_response.PortNumber);
+    {
+      std::scoped_lock lock(mutex_, instruction_mutex_);
+      json_responses_.clear();
+      last_instruction_response_.reset();
+      sequence_number_ = 1;
+    }
     return connect_response;
   });
 }
 
 Response<DisconnectPacket::Response> FanucRmiDriver::disconnect(const std::optional<double> timeout)
 {
-  return rmi::detail::captureResponse<DisconnectPacket::Response>([&]() {
+  return commandResponse<DisconnectPacket::Response>([&]() {
+    std::scoped_lock motion_lock(motion_mutex_);
     connection_impl_->write(DisconnectPacket::Request());
     return getResponsePacket<DisconnectPacket::Response>(timeout, "Failed to disconnect from RMI server. ",
                                                          std::nullopt);
@@ -591,19 +911,15 @@ Response<InitializePacket::Response> FanucRmiDriver::initializeRemoteMotion(cons
 }
 
 Response<InitializePacket::Response> FanucRmiDriver::initializeRemoteMotion(const std::optional<double> timeout,
-                                                                          const std::optional<uint8_t> groupmask,
-                                                                          const std::optional<std::string>& rtsa,
-                                                                          const std::optional<std::string>& pltzmode)
+                                                                            const std::optional<uint8_t> groupmask,
+                                                                            const std::optional<std::string>& rtsa,
+                                                                            const std::optional<std::string>& pltzmode)
 {
-  return rmi::detail::captureResponse<InitializePacket::Response>([&]() {
-    {
-      std::scoped_lock lock(mutex_);
-      sequence_number_ = 1;  // Reset sequence number for a new session
-    }
-    {
-      std::scoped_lock lock(instruction_mutex_);
-      last_instruction_response_ = std::nullopt;
-    }
+  return commandResponse<InitializePacket::Response>([&]() {
+    std::scoped_lock motion_lock(motion_mutex_);
+    const auto idle_status = connection_impl_->checkInstructionsIdle();
+    if (!idle_status.ok())
+      throw rmi::detail::ResponseError(idle_status);
 
     const auto packet = [&]() {
       auto request = InitializePacket::Request();
@@ -614,7 +930,14 @@ Response<InitializePacket::Response> FanucRmiDriver::initializeRemoteMotion(cons
     }();
     connection_impl_->write(packet);
 
-    return getResponsePacket<InitializePacket::Response>(timeout, "Failed to initialize RMI. ", std::nullopt);
+    auto response = getResponsePacket<InitializePacket::Response>(timeout, "Failed to initialize RMI. ", std::nullopt);
+    {
+      std::scoped_lock lock(mutex_, instruction_mutex_);
+      sequence_number_ = 1;
+      last_instruction_response_.reset();
+      std::erase_if(json_responses_, [](const auto& frame) { return IsInstruction(frame).has_value(); });
+    }
+    return response;
   });
 }
 
@@ -624,7 +947,7 @@ ProgramCallPacket::Request FanucRmiDriver::programCallNonBlocking(const std::str
 }
 
 ProgramCallPacket::Request FanucRmiDriver::programCallNonBlocking(const std::string& program_name,
-                                                                const std::vector<RMICallParam>& params)
+                                                                  const std::vector<RMICallParam>& params)
 {
   ProgramCallPacket::Request program_call_packet;
   program_call_packet.ProgramName = program_name;
@@ -636,26 +959,27 @@ ProgramCallPacket::Request FanucRmiDriver::programCallNonBlocking(const std::str
 }
 
 Response<ProgramCallPacket::Response> FanucRmiDriver::programCall(const std::string& program_name,
-                                                                const std::optional<double> timeout)
+                                                                  const std::optional<double> timeout)
 {
   return programCall(program_name, timeout, {});
 }
 
 Response<ProgramCallPacket::Response> FanucRmiDriver::programCall(const std::string& program_name,
-                                                                std::optional<double> timeout,
-                                                                const std::vector<RMICallParam>& params)
+                                                                  std::optional<double> timeout,
+                                                                  const std::vector<RMICallParam>& params)
 {
   return rmi::detail::captureResponse<ProgramCallPacket::Response>([&]() {
-    ProgramCallPacket::Request program_call_packet = programCallNonBlocking(program_name, params);
-    return getResponsePacket<ProgramCallPacket::Response>(
-        timeout, "Failed to call program named `" + program_name + "`. ", program_call_packet.SequenceID);
+    ProgramCallPacket::Request request{};
+    request.ProgramName = program_name;
+    addCallArguments(request, params);
+    return waitInstruction<ProgramCallPacket::Response>(sendInstructionAsync(request), timeout);
   });
 }
 
 Response<SetSpeedOverridePacket::Response> FanucRmiDriver::setSpeedOverride(const int value,
-                                                                          const std::optional<double> timeout)
+                                                                            const std::optional<double> timeout)
 {
-  return rmi::detail::captureResponse<SetSpeedOverridePacket::Response>([&]() {
+  return commandResponse<SetSpeedOverridePacket::Response>([&]() {
     SetSpeedOverridePacket::Request set_speed_override_packet;
     set_speed_override_packet.Value = value;
     connection_impl_->write(set_speed_override_packet);
@@ -666,7 +990,7 @@ Response<SetSpeedOverridePacket::Response> FanucRmiDriver::setSpeedOverride(cons
 
 Response<StatusRequestPacket::Response> FanucRmiDriver::getStatus(const std::optional<double> timeout)
 {
-  return rmi::detail::captureResponse<StatusRequestPacket::Response>([&]() {
+  return commandResponse<StatusRequestPacket::Response>([&]() {
     connection_impl_->write(StatusRequestPacket::Request());
     return getResponsePacket<StatusRequestPacket::Response>(timeout, "Failed to get status from RMI server. ",
                                                             std::nullopt);
@@ -675,7 +999,7 @@ Response<StatusRequestPacket::Response> FanucRmiDriver::getStatus(const std::opt
 
 Response<AbortPacket::Response> FanucRmiDriver::abort(const std::optional<double> timeout)
 {
-  return rmi::detail::captureResponse<AbortPacket::Response>([&]() {
+  return commandResponse<AbortPacket::Response>([&]() {
     connection_impl_->write(AbortPacket::Request());
     return getResponsePacket<AbortPacket::Response>(timeout, "Failed to abort. ", std::nullopt);
   });
@@ -683,7 +1007,7 @@ Response<AbortPacket::Response> FanucRmiDriver::abort(const std::optional<double
 
 Response<PausePacket::Response> FanucRmiDriver::pause(const std::optional<double> timeout)
 {
-  return rmi::detail::captureResponse<PausePacket::Response>([&]() {
+  return commandResponse<PausePacket::Response>([&]() {
     connection_impl_->write(PausePacket::Request());
     return getResponsePacket<PausePacket::Response>(timeout, "Failed to pause. ", std::nullopt);
   });
@@ -691,7 +1015,7 @@ Response<PausePacket::Response> FanucRmiDriver::pause(const std::optional<double
 
 Response<ContinuePacket::Response> FanucRmiDriver::resume(const std::optional<double> timeout)
 {
-  return rmi::detail::captureResponse<ContinuePacket::Response>([&]() {
+  return commandResponse<ContinuePacket::Response>([&]() {
     connection_impl_->write(ContinuePacket::Request());
     return getResponsePacket<ContinuePacket::Response>(timeout, "Failed to continue. ", std::nullopt);
   });
@@ -699,7 +1023,7 @@ Response<ContinuePacket::Response> FanucRmiDriver::resume(const std::optional<do
 
 Response<ResetRobotPacket::Response> FanucRmiDriver::reset(const std::optional<double> timeout)
 {
-  return rmi::detail::captureResponse<ResetRobotPacket::Response>([&]() {
+  return commandResponse<ResetRobotPacket::Response>([&]() {
     connection_impl_->write(ResetRobotPacket::Request());
     return getResponsePacket<ResetRobotPacket::Response>(timeout, "Failed to reset. ", std::nullopt);
   });
@@ -711,9 +1035,9 @@ Response<ReadErrorPacket::Response> FanucRmiDriver::readError(const std::optiona
 }
 
 Response<ReadErrorPacket::Response> FanucRmiDriver::readError(const std::optional<double> timeout,
-                                                            const std::optional<uint8_t> count)
+                                                              const std::optional<uint8_t> count)
 {
-  return rmi::detail::captureResponse<ReadErrorPacket::Response>([&]() {
+  return commandResponse<ReadErrorPacket::Response>([&]() {
     const auto packet = [&]() {
       auto request = ReadErrorPacket::Request();
       request.Count = count;
@@ -725,7 +1049,7 @@ Response<ReadErrorPacket::Response> FanucRmiDriver::readError(const std::optiona
 }
 
 Response<GetUFrameToolFramePacket::Response> FanucRmiDriver::getUFrameUTool(std::optional<double> timeout,
-                                                                          const std::optional<uint8_t> group)
+                                                                            const std::optional<uint8_t> group)
 {
   auto request = GetUFrameToolFramePacket::Request();
   request.Group = group;
@@ -734,8 +1058,8 @@ Response<GetUFrameToolFramePacket::Response> FanucRmiDriver::getUFrameUTool(std:
 }
 
 Response<SetUFrameToolFramePacket::Response> FanucRmiDriver::setUFrameUTool(const int uframe, const int utool,
-                                                                          std::optional<double> timeout,
-                                                                          const std::optional<uint8_t> group)
+                                                                            std::optional<double> timeout,
+                                                                            const std::optional<uint8_t> group)
 {
   auto request = SetUFrameToolFramePacket::Request();
   request.UFrameNumber = uframe;
@@ -746,7 +1070,7 @@ Response<SetUFrameToolFramePacket::Response> FanucRmiDriver::setUFrameUTool(cons
 }
 
 Response<ReadUFrameDataPacket::Response> FanucRmiDriver::readUFrameData(const int uframe, std::optional<double> timeout,
-                                                                      const std::optional<uint8_t> group)
+                                                                        const std::optional<uint8_t> group)
 {
   auto request = ReadUFrameDataPacket::Request();
   request.FrameNumber = uframe;
@@ -756,8 +1080,8 @@ Response<ReadUFrameDataPacket::Response> FanucRmiDriver::readUFrameData(const in
 }
 
 Response<WriteUFrameDataPacket::Response> FanucRmiDriver::writeUFrameData(const int uframe, const FrameData data,
-                                                                        std::optional<double> timeout,
-                                                                        const std::optional<uint8_t> group)
+                                                                          std::optional<double> timeout,
+                                                                          const std::optional<uint8_t> group)
 {
   auto request = WriteUFrameDataPacket::Request();
   request.FrameNumber = uframe;
@@ -768,7 +1092,7 @@ Response<WriteUFrameDataPacket::Response> FanucRmiDriver::writeUFrameData(const 
 }
 
 Response<ReadUToolDataPacket::Response> FanucRmiDriver::readUToolData(const int utool, std::optional<double> timeout,
-                                                                    const std::optional<uint8_t> group)
+                                                                      const std::optional<uint8_t> group)
 {
   auto request = ReadUToolDataPacket::Request();
   request.ToolNumber = utool;
@@ -778,8 +1102,8 @@ Response<ReadUToolDataPacket::Response> FanucRmiDriver::readUToolData(const int 
 }
 
 Response<WriteUToolDataPacket::Response> FanucRmiDriver::writeUToolData(const int utool, const FrameData data,
-                                                                      std::optional<double> timeout,
-                                                                      const std::optional<uint8_t> group)
+                                                                        std::optional<double> timeout,
+                                                                        const std::optional<uint8_t> group)
 {
   auto request = WriteUToolDataPacket::Request();
   request.ToolNumber = utool;
@@ -791,10 +1115,10 @@ Response<WriteUToolDataPacket::Response> FanucRmiDriver::writeUToolData(const in
 
 Response<WritePositionRegisterPacket::Response>
 FanucRmiDriver::writePositionRegister(const int register_number, const std::string& representation,
-                                    const ConfigurationData& configuration, const PositionData& position,
-                                    const JointAngleData& joint_angle, const std::optional<double> timeout)
+                                      const ConfigurationData& configuration, const PositionData& position,
+                                      const JointAngleData& joint_angle, const std::optional<double> timeout)
 {
-  return rmi::detail::captureResponse<WritePositionRegisterPacket::Response>([&]() {
+  return commandResponse<WritePositionRegisterPacket::Response>([&]() {
     if (register_number < 1 || register_number > 100)
     {
       throw rmi::detail::ResponseError(
@@ -824,7 +1148,7 @@ FanucRmiDriver::writePositionRegister(const int register_number, const std::stri
 std::expected<ReadPositionRegisterPacket::Response, ResponseStatus>
 FanucRmiDriver::readPositionRegister(const int register_number, const std::optional<double> timeout)
 {
-  return rmi::detail::captureExpected<ReadPositionRegisterPacket::Response>([&]() {
+  return commandExpected<ReadPositionRegisterPacket::Response>([&]() {
     if (register_number < 1 || register_number > 100)
     {
       throw rmi::detail::ResponseError(
@@ -842,7 +1166,7 @@ FanucRmiDriver::readPositionRegister(const int register_number, const std::optio
 std::expected<ReadNumericRegisterPacket::Response, ResponseStatus>
 FanucRmiDriver::readNumericRegister(const int register_number, const std::optional<double> timeout)
 {
-  return rmi::detail::captureExpected<ReadNumericRegisterPacket::Response>([&]() {
+  return commandExpected<ReadNumericRegisterPacket::Response>([&]() {
     if (register_number < 1 || register_number > 200)
     {
       throw rmi::detail::ResponseError(
@@ -857,11 +1181,11 @@ FanucRmiDriver::readNumericRegister(const int register_number, const std::option
   });
 }
 
-Response<WriteNumericRegisterPacket::Response> FanucRmiDriver::writeNumericRegister(const int register_number,
-                                                                                  const std::variant<int, float> value,
-                                                                                  const std::optional<double> timeout)
+Response<WriteNumericRegisterPacket::Response>
+FanucRmiDriver::writeNumericRegister(const int register_number, const std::variant<int, float> value,
+                                     const std::optional<double> timeout)
 {
-  return rmi::detail::captureResponse<WriteNumericRegisterPacket::Response>([&]() {
+  return commandResponse<WriteNumericRegisterPacket::Response>([&]() {
     if (register_number < 1 || register_number > 200)
     {
       throw rmi::detail::ResponseError(
@@ -881,7 +1205,7 @@ Response<WriteNumericRegisterPacket::Response> FanucRmiDriver::writeNumericRegis
 std::expected<ReadDigitalInputPortPacket::Response, ResponseStatus>
 FanucRmiDriver::readDigitalInputPort(const uint16_t port_number, const std::optional<double> timeout)
 {
-  return rmi::detail::captureExpected<ReadDigitalInputPortPacket::Response>([&]() {
+  return commandExpected<ReadDigitalInputPortPacket::Response>([&]() {
     ReadDigitalInputPortPacket::Request read_digital_input_port_packet;
     read_digital_input_port_packet.PortNumber = port_number;
     connection_impl_->write(read_digital_input_port_packet);
@@ -891,10 +1215,10 @@ FanucRmiDriver::readDigitalInputPort(const uint16_t port_number, const std::opti
 }
 
 Response<WriteDigitalOutputPacket::Response> FanucRmiDriver::writeDigitalOutputPort(const uint16_t port_number,
-                                                                                  const bool port_value,
-                                                                                  const std::optional<double> timeout)
+                                                                                    const bool port_value,
+                                                                                    const std::optional<double> timeout)
 {
-  return rmi::detail::captureResponse<WriteDigitalOutputPacket::Response>([&]() {
+  return commandResponse<WriteDigitalOutputPacket::Response>([&]() {
     WriteDigitalOutputPacket::Request write_digital_output_packet;
     write_digital_output_packet.PortNumber = port_number;
     write_digital_output_packet.PortValue = port_value ? "ON" : "OFF";
@@ -907,7 +1231,7 @@ Response<WriteDigitalOutputPacket::Response> FanucRmiDriver::writeDigitalOutputP
 std::expected<ReadIOPortPacket::Response, ResponseStatus>
 FanucRmiDriver::readIOPort(const std::string& port_type, const int port_number, const std::optional<double> timeout)
 {
-  return rmi::detail::captureExpected<ReadIOPortPacket::Response>([&]() {
+  return commandExpected<ReadIOPortPacket::Response>([&]() {
     ReadIOPortPacket::Request read_io_port_packet;
     read_io_port_packet.PortNumber = port_number;
     read_io_port_packet.PortType = port_type;
@@ -917,10 +1241,10 @@ FanucRmiDriver::readIOPort(const std::string& port_type, const int port_number, 
 }
 
 Response<WriteIOPortPacket::Response> FanucRmiDriver::writeIOPort(const int port_number, const std::string& port_type,
-                                                                const std::variant<int, float> port_value,
-                                                                const std::optional<double> timeout)
+                                                                  const std::variant<int, float> port_value,
+                                                                  const std::optional<double> timeout)
 {
-  return rmi::detail::captureResponse<WriteIOPortPacket::Response>([&]() {
+  return commandResponse<WriteIOPortPacket::Response>([&]() {
     WriteIOPortPacket::Request write_io_port_packet;
     write_io_port_packet.PortNumber = port_number;
     write_io_port_packet.PortType = port_type;
@@ -931,9 +1255,9 @@ Response<WriteIOPortPacket::Response> FanucRmiDriver::writeIOPort(const int port
 }
 
 Response<ReadVariablePacket::Response> FanucRmiDriver::readVariablePacket(const std::string& variable_name,
-                                                                        const std::optional<double> timeout)
+                                                                          const std::optional<double> timeout)
 {
-  return rmi::detail::captureResponse<ReadVariablePacket::Response>([&]() {
+  return commandResponse<ReadVariablePacket::Response>([&]() {
     ReadVariablePacket::Request read_variable_packet;
     read_variable_packet.VariableName = variable_name;
     connection_impl_->write(read_variable_packet);
@@ -943,10 +1267,10 @@ Response<ReadVariablePacket::Response> FanucRmiDriver::readVariablePacket(const 
 }
 
 Response<WriteVariablePacket::Response> FanucRmiDriver::writeVariablePacket(const std::string& variable_name,
-                                                                          const std::variant<int, float> value,
-                                                                          const std::optional<double> timeout)
+                                                                            const std::variant<int, float> value,
+                                                                            const std::optional<double> timeout)
 {
-  return rmi::detail::captureResponse<WriteVariablePacket::Response>([&]() {
+  return commandResponse<WriteVariablePacket::Response>([&]() {
     WriteVariablePacket::Request write_variable_packet;
     write_variable_packet.VariableName = variable_name;
     write_variable_packet.VariableValue = value;
@@ -959,7 +1283,7 @@ Response<WriteVariablePacket::Response> FanucRmiDriver::writeVariablePacket(cons
 
 Response<GetExtendedStatusPacket::Response> FanucRmiDriver::getExtendedStatus(const std::optional<double> timeout)
 {
-  return rmi::detail::captureResponse<GetExtendedStatusPacket::Response>([&]() {
+  return commandResponse<GetExtendedStatusPacket::Response>([&]() {
     connection_impl_->write(GetExtendedStatusPacket::Request());
     return getResponsePacket<GetExtendedStatusPacket::Response>(timeout, "Failed to get extended status. ",
                                                                 std::nullopt);
@@ -967,9 +1291,9 @@ Response<GetExtendedStatusPacket::Response> FanucRmiDriver::getExtendedStatus(co
 }
 
 Response<SetPayloadPacket::Response> FanucRmiDriver::setPayloadSchedule(const uint8_t payload_schedule_number,
-                                                                      const std::optional<double> timeout)
+                                                                        const std::optional<double> timeout)
 {
-  return rmi::detail::captureResponse<SetPayloadPacket::Response>([&]() {
+  return commandResponse<SetPayloadPacket::Response>([&]() {
     SetPayloadPacket::Request set_payload_packet;
     set_payload_packet.ScheduleNumber = payload_schedule_number;
     std::scoped_lock lock(motion_mutex_);
@@ -980,10 +1304,10 @@ Response<SetPayloadPacket::Response> FanucRmiDriver::setPayloadSchedule(const ui
 
 Response<SetPayloadValuePacket::Response>
 FanucRmiDriver::setPayloadValue(const uint8_t payload_schedule_number, const float mass, const float cg_x,
-                              const float cg_y, const float cg_z, const bool use_in, const float in_x, const float in_y,
-                              const float in_z, const std::optional<double> timeout)
+                                const float cg_y, const float cg_z, const bool use_in, const float in_x,
+                                const float in_y, const float in_z, const std::optional<double> timeout)
 {
-  return rmi::detail::captureResponse<SetPayloadValuePacket::Response>([&]() {
+  return commandResponse<SetPayloadValuePacket::Response>([&]() {
     SetPayloadValuePacket::Request set_payload_value_packet;
     set_payload_value_packet.ScheduleNumber = payload_schedule_number;
     set_payload_value_packet.Mass = mass;
@@ -1005,10 +1329,10 @@ FanucRmiDriver::setPayloadValue(const uint8_t payload_schedule_number, const flo
 
 Response<SetPayloadCompPacket::Response>
 FanucRmiDriver::setPayloadComp(const uint8_t payload_schedule_number, const float mass, const float cg_x,
-                             const float cg_y, const float cg_z, const float in_x, const float in_y, const float in_z,
-                             const std::optional<double> timeout)
+                               const float cg_y, const float cg_z, const float in_x, const float in_y, const float in_z,
+                               const std::optional<double> timeout)
 {
-  return rmi::detail::captureResponse<SetPayloadCompPacket::Response>([&]() {
+  return commandResponse<SetPayloadCompPacket::Response>([&]() {
     SetPayloadCompPacket::Request set_payload_comp_packet;
     set_payload_comp_packet.ScheduleNumber = payload_schedule_number;
     set_payload_comp_packet.Mass = mass;
@@ -1027,7 +1351,7 @@ FanucRmiDriver::setPayloadComp(const uint8_t payload_schedule_number, const floa
 
 Response<GetPayloadPacket::Response> FanucRmiDriver::getPayloadSchedule(const std::optional<double> timeout)
 {
-  return rmi::detail::captureResponse<GetPayloadPacket::Response>([&]() {
+  return commandResponse<GetPayloadPacket::Response>([&]() {
     GetPayloadPacket::Request get_payload_packet;
     std::scoped_lock lock(motion_mutex_);
     connection_impl_->write(get_payload_packet);
@@ -1036,9 +1360,9 @@ Response<GetPayloadPacket::Response> FanucRmiDriver::getPayloadSchedule(const st
 }
 
 Response<GetPayloadValuePacket::Response> FanucRmiDriver::getPayloadValue(const uint16_t payload_schedule_number,
-                                                                        const std::optional<double> timeout)
+                                                                          const std::optional<double> timeout)
 {
-  return rmi::detail::captureResponse<GetPayloadValuePacket::Response>([&]() {
+  return commandResponse<GetPayloadValuePacket::Response>([&]() {
     GetPayloadValuePacket::Request get_payload_value_packet;
     get_payload_value_packet.ScheduleNumber = payload_schedule_number;
     std::scoped_lock lock(motion_mutex_);
@@ -1049,9 +1373,9 @@ Response<GetPayloadValuePacket::Response> FanucRmiDriver::getPayloadValue(const 
 }
 
 Response<GetPayloadCompPacket::Response> FanucRmiDriver::getPayloadComp(const uint16_t payload_schedule_number,
-                                                                      const std::optional<double> timeout)
+                                                                        const std::optional<double> timeout)
 {
-  return rmi::detail::captureResponse<GetPayloadCompPacket::Response>([&]() {
+  return commandResponse<GetPayloadCompPacket::Response>([&]() {
     GetPayloadCompPacket::Request get_payload_comp_packet;
     get_payload_comp_packet.ScheduleNumber = payload_schedule_number;
     std::scoped_lock lock(motion_mutex_);
@@ -1062,9 +1386,9 @@ Response<GetPayloadCompPacket::Response> FanucRmiDriver::getPayloadComp(const ui
 }
 
 Response<ReadJointAnglesPacket::Response> FanucRmiDriver::readJointAngles(const std::optional<uint8_t>& group,
-                                                                        const std::optional<double> timeout)
+                                                                          const std::optional<double> timeout)
 {
-  return rmi::detail::captureResponse<ReadJointAnglesPacket::Response>([&]() {
+  return commandResponse<ReadJointAnglesPacket::Response>([&]() {
     ReadJointAnglesPacket::Request read_joint_angles_packet;
     read_joint_angles_packet.Group = group;
     connection_impl_->write(read_joint_angles_packet);
@@ -1073,9 +1397,9 @@ Response<ReadJointAnglesPacket::Response> FanucRmiDriver::readJointAngles(const 
 }
 
 Response<GetCartesianPositionPacket::Response> FanucRmiDriver::getCartesianPosition(std::optional<double> timeout,
-                                                                                  const std::optional<uint8_t> group)
+                                                                                    const std::optional<uint8_t> group)
 {
-  return rmi::detail::captureResponse<GetCartesianPositionPacket::Response>([&]() {
+  return commandResponse<GetCartesianPositionPacket::Response>([&]() {
     GetCartesianPositionPacket::Request packet;
     packet.Group = group;
     connection_impl_->write(packet);
@@ -1085,9 +1409,9 @@ Response<GetCartesianPositionPacket::Response> FanucRmiDriver::getCartesianPosit
 }
 
 Response<GetTCPSpeedPacket::Response> FanucRmiDriver::getTCPSpeed(std::optional<double> timeout,
-                                                                const std::optional<uint8_t> group)
+                                                                  const std::optional<uint8_t> group)
 {
-  return rmi::detail::captureResponse<GetTCPSpeedPacket::Response>([&]() {
+  return commandResponse<GetTCPSpeedPacket::Response>([&]() {
     GetTCPSpeedPacket::Request packet;
     packet.Group = group;
     connection_impl_->write(packet);
@@ -1098,12 +1422,7 @@ Response<GetTCPSpeedPacket::Response> FanucRmiDriver::getTCPSpeed(std::optional<
 Response<JointMotionJRepPacket::Response>
 FanucRmiDriver::sendJointMotion(JointMotionJRepPacket::Request joint_motion_request, const std::optional<double> timeout)
 {
-  return rmi::detail::captureResponse<JointMotionJRepPacket::Response>([&]() {
-    joint_motion_request.SequenceID = getSequenceNumber();
-    connection_impl_->write(joint_motion_request);
-    return getResponsePacket<JointMotionJRepPacket::Response>(timeout, "Failed to send joint motion. ",
-                                                              joint_motion_request.SequenceID);
-  });
+  return sendRMIPacket<JointMotionJRepPacket>(joint_motion_request, timeout);
 }
 
 void FanucRmiDriver::sendRMIPacketNonBlocking(JointMotionPacket::Request& packet)
@@ -1200,33 +1519,33 @@ std::string FanucRmiDriver::getErrorMessageString(const uint32_t error_code)
 
 int32_t FanucRmiDriver::getRemainingBufferSize()
 {
-  constexpr int32_t kMaxBufferSize = 8;
-  getLastInstructionResponse();
-  std::scoped_lock lock(instruction_mutex_);
-  const auto acknowledged = last_instruction_response_ ? last_instruction_response_->SequenceID : 0;
-  return kMaxBufferSize - (sequence_number_ - 1 - acknowledged);
+  std::scoped_lock lock(motion_mutex_);
+  return connection_impl_->remaining();
 }
 
 void FanucRmiDriver::setEncoding(const std::string& encoding)
 {
+  std::scoped_lock lock(command_mutex_, motion_mutex_);
   encoding_ = encoding;
 }
 
 template <typename T>
 Response<typename T::Response> FanucRmiDriver::sendRMIPacket(typename T::Request& request_packet,
-                                                           const std::optional<double> timeout)
+                                                             const std::optional<double> timeout)
 {
   return rmi::detail::captureResponse<typename T::Response>([&]() {
     if constexpr (requires(typename T::Response t) { t.SequenceID; })
     {
-      std::scoped_lock lock(motion_mutex_);
-      request_packet.SequenceID = getSequenceNumber();
-      connection_impl_->write(request_packet);
-      return getResponsePacket<typename T::Response>(timeout, "Failed to send packet. ", request_packet.SequenceID);
+      const auto handle = sendInstructionAsync(request_packet);
+      request_packet.SequenceID = handle.sequence_id;
+      return waitInstruction<typename T::Response>(handle, timeout);
     }
-
-    connection_impl_->write(request_packet);
-    return getResponsePacket<typename T::Response>(timeout, "Failed to send packet. ", std::nullopt);
+    else
+    {
+      std::scoped_lock lock(command_mutex_);
+      connection_impl_->write(request_packet);
+      return getResponsePacket<typename T::Response>(timeout, "Failed to send packet. ", std::nullopt);
+    }
   });
 }
 
@@ -1263,10 +1582,10 @@ template Response<GetUFrameToolFramePacket::Response>
 FanucRmiDriver::sendRMIPacket<GetUFrameToolFramePacket>(GetUFrameToolFramePacket::Request&, std::optional<double>);
 template Response<GetTCPSpeedPacket::Response>
 FanucRmiDriver::sendRMIPacket<GetTCPSpeedPacket>(GetTCPSpeedPacket::Request&, std::optional<double>);
-template Response<WaitForDINPacket::Response> FanucRmiDriver::sendRMIPacket<WaitForDINPacket>(WaitForDINPacket::Request&,
-                                                                                            std::optional<double>);
+template Response<WaitForDINPacket::Response>
+FanucRmiDriver::sendRMIPacket<WaitForDINPacket>(WaitForDINPacket::Request&, std::optional<double>);
 template Response<SetUFramePacket::Response> FanucRmiDriver::sendRMIPacket<SetUFramePacket>(SetUFramePacket::Request&,
-                                                                                          std::optional<double>);
+                                                                                            std::optional<double>);
 template Response<SetToolFramePacket::Response>
 FanucRmiDriver::sendRMIPacket<SetToolFramePacket>(SetToolFramePacket::Request&, std::optional<double>);
 template Response<WaitForTimePacket::Response>
@@ -1296,6 +1615,6 @@ FanucRmiDriver::sendRMIPacket<SplineMotionPacket>(SplineMotionPacket::Request&, 
 template Response<SplineMotionJRepPacket::Response>
 FanucRmiDriver::sendRMIPacket<SplineMotionJRepPacket>(SplineMotionJRepPacket::Request&, std::optional<double>);
 template Response<ConnectPacket::Response> FanucRmiDriver::sendRMIPacket<ConnectPacket>(ConnectPacket::Request&,
-                                                                                      std::optional<double>);
+                                                                                        std::optional<double>);
 template Response<SetPayloadInstructionPacket::Response>
 FanucRmiDriver::sendRMIPacket<SetPayloadInstructionPacket>(SetPayloadInstructionPacket::Request&, std::optional<double>);
