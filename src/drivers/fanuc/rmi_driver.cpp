@@ -15,6 +15,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <deque>
+#include <exception>
 #include <expected>
 #include <iostream>
 #include <iterator>
@@ -28,7 +29,19 @@
 #include <unordered_map>
 #include <utility>
 
-#include <boost/asio.hpp>
+#include <boost/asio/as_tuple.hpp>
+#include <boost/asio/awaitable.hpp>
+#include <boost/asio/buffer.hpp>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/connect.hpp>
+#include <boost/asio/executor_work_guard.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/post.hpp>
+#include <boost/asio/steady_timer.hpp>
+#include <boost/asio/use_awaitable.hpp>
+#include <boost/asio/use_future.hpp>
+#include <boost/asio/write.hpp>
 #include "detail/packets.hpp"
 
 using namespace rmi;
@@ -163,6 +176,7 @@ struct FanucRmiDriver::PConnectionImpl
 {
   using Clock = std::chrono::steady_clock;
   using InstructionResult = Response<InstructionResponse>;
+  static constexpr int kInstructionWindow = 8;
 
   struct Write
   {
@@ -170,6 +184,16 @@ struct FanucRmiDriver::PConnectionImpl
     std::optional<int> sequence;
     std::string instruction;
     std::promise<ResponseStatus> written;
+    bool completed = false;
+
+    void complete(const ResponseStatus& status)
+    {
+      if (!completed)
+      {
+        written.set_value(status);
+        completed = true;
+      }
+    }
   };
 
   PConnectionImpl(const std::string& robot_ip_address, const uint16_t robot_port)
@@ -244,18 +268,13 @@ struct FanucRmiDriver::PConnectionImpl
   {
     stop();
     context_.restart();
-    boost::asio::ip::tcp::resolver resolver(context_);
-    boost::system::error_code error;
-    const auto endpoints = resolver.resolve(robot_ip_address, std::to_string(robot_port), error);
-    if (error)
-      throw rmi::detail::ResponseError({ ResponseCode::CONNECTION_ERROR,
-                                         "Failed to resolve RMI server " + robot_ip_address + ": " + error.message() });
-
-    boost::asio::connect(socket_, endpoints, error);
-    if (error)
-      throw rmi::detail::ResponseError(
-          { ResponseCode::CONNECTION_ERROR, "Failed to create TCP connection at " + robot_ip_address + ":" +
-                                                std::to_string(robot_port) + ": " + error.message() });
+    auto connected = boost::asio::co_spawn(context_, openConnection(robot_ip_address, robot_port),
+                                           boost::asio::use_future);
+    context_.run();
+    const auto status = connected.get();
+    if (!status.ok())
+      throw rmi::detail::ResponseError(status);
+    context_.restart();
     failure_.reset();
     instruction_failure_.reset();
     {
@@ -265,9 +284,11 @@ struct FanucRmiDriver::PConnectionImpl
       last_instruction_.reset();
       outstanding_ = 0;
     }
-    line_buffer_ = {};
     work_.emplace(boost::asio::make_work_guard(context_));
-    startRead();
+    boost::asio::co_spawn(context_, readLoop(),
+                          [this](std::exception_ptr error) { coroutineFinished(error, "receive"); });
+    boost::asio::co_spawn(context_, writeLoop(),
+                          [this](std::exception_ptr error) { coroutineFinished(error, "write"); });
     worker_ = std::thread([this]() { context_.run(); });
   }
 
@@ -303,7 +324,7 @@ struct FanucRmiDriver::PConnectionImpl
     auto result = promise.get_future();
     boost::asio::post(context_, [this, &promise]() {
       std::scoped_lock lock(mutex_);
-      promise.set_value(std::max(0, 8 - outstanding_));
+      promise.set_value(std::max(0, kInstructionWindow - outstanding_));
     });
     return result.get();
   }
@@ -332,17 +353,49 @@ struct FanucRmiDriver::PConnectionImpl
   }
 
 private:
+  boost::asio::awaitable<ResponseStatus> openConnection(std::string address, uint16_t port)
+  {
+    boost::asio::ip::tcp::resolver resolver(context_);
+    const auto [resolve_error, endpoints] =
+        co_await resolver.async_resolve(address, std::to_string(port),
+                                       boost::asio::as_tuple(boost::asio::use_awaitable));
+    if (resolve_error)
+      co_return ResponseStatus{ ResponseCode::CONNECTION_ERROR,
+                                "Failed to resolve RMI server " + address + ": " + resolve_error.message() };
+
+    const auto [connect_error, endpoint] =
+        co_await boost::asio::async_connect(socket_, endpoints, boost::asio::as_tuple(boost::asio::use_awaitable));
+    if (connect_error)
+      co_return ResponseStatus{ ResponseCode::CONNECTION_ERROR, "Failed to create TCP connection at " + address + ":" +
+                                                                  std::to_string(port) + ": " + connect_error.message() };
+    co_return ResponseStatus{};
+  }
+
+  void coroutineFinished(std::exception_ptr error, const char* operation)
+  {
+    if (!error)
+      return;
+    try
+    {
+      std::rethrow_exception(error);
+    }
+    catch (const std::exception& exception)
+    {
+      fail({ ResponseCode::SERVER_ERR,
+             "RMI " + std::string(operation) + " coroutine failed: " + exception.what() });
+    }
+  }
+
   void stop()
   {
     if (!worker_.joinable())
       return;
     boost::asio::post(context_, [this]() {
       fail({ ResponseCode::CONNECTION_ERROR, "RMI TCP session ended; instruction completion is unknown." });
-      boost::system::error_code error;
-      socket_.close(error);
       work_.reset();
     });
     worker_.join();
+    active_write_.reset();
   }
 
   void failInstructions(const ResponseStatus& status)
@@ -352,11 +405,13 @@ private:
       promise->set_value({ status, std::nullopt });
     pending_.clear();
     in_flight_.clear();
+    if (active_write_ && active_write_->sequence)
+      active_write_->complete(status);
     for (auto it = writes_.begin(); it != writes_.end();)
     {
       if ((*it)->sequence)
       {
-        (*it)->written.set_value(status);
+        (*it)->complete(status);
         it = writes_.erase(it);
       }
       else
@@ -372,9 +427,14 @@ private:
       return;
     failure_ = status;
     failInstructions(status);
+    if (active_write_)
+      active_write_->complete(status);
     for (auto& operation : writes_)
-      operation->written.set_value(status);
+      operation->complete(status);
     writes_.clear();
+    boost::system::error_code ignored;
+    socket_.close(ignored);
+    write_ready_.cancel();
     {
       std::scoped_lock lock(mutex_);
       read_failure_ = status;
@@ -386,7 +446,7 @@ private:
   {
     if (failure_)
     {
-      operation->written.set_value(*failure_);
+      operation->complete(*failure_);
       return;
     }
     if (operation->sequence && instruction_failure_)
@@ -396,7 +456,7 @@ private:
         pending->second->set_value({ *instruction_failure_, std::nullopt });
         pending_.erase(pending);
       }
-      operation->written.set_value(*instruction_failure_);
+      operation->complete(*instruction_failure_);
       return;
     }
     writes_.push_back(operation);
@@ -405,36 +465,38 @@ private:
       std::scoped_lock lock(mutex_);
       ++outstanding_;
     }
-    pumpWrites();
+    write_ready_.cancel_one();
   }
 
-  void pumpWrites()
+  boost::asio::awaitable<void> writeLoop()
   {
-    if (writing_ || failure_)
-      return;
-    const auto next = std::ranges::find_if(writes_, [this](const auto& operation) {
-      return !operation->sequence || in_flight_.size() < 8;
-    });
-    if (next == writes_.end())
-      return;
-    auto operation = *next;
-    writes_.erase(next);
-    if (operation->sequence)
-      in_flight_.emplace(*operation->sequence, operation->instruction);
-    writing_ = true;
-    boost::asio::async_write(socket_, boost::asio::buffer(operation->bytes),
-                             [this, operation](boost::system::error_code error, std::size_t) {
-                               writing_ = false;
-                               ResponseStatus status;
-                               if (error)
-                               {
-                                 status = { ResponseCode::CONNECTION_ERROR,
-                                            "Failed to write to RMI TCP connection: " + error.message() };
-                                 fail(status);
-                               }
-                               operation->written.set_value(status);
-                               pumpWrites();
-                             });
+    while (!failure_)
+    {
+      const auto next = std::ranges::find_if(writes_, [this](const auto& operation) {
+        return !operation->sequence || in_flight_.size() < kInstructionWindow;
+      });
+      if (next == writes_.end())
+      {
+        // A timer is an executor-local notification, not a polling interval or response deadline.
+        write_ready_.expires_at(Clock::time_point::max());
+        const auto [error] = co_await write_ready_.async_wait(boost::asio::as_tuple(boost::asio::use_awaitable));
+        if (error && error != boost::asio::error::operation_aborted)
+          fail({ ResponseCode::CONNECTION_ERROR, "Failed to wait for RMI writes: " + error.message() });
+        continue;
+      }
+      auto operation = *next;
+      writes_.erase(next);
+      active_write_ = operation;
+      if (operation->sequence)
+        in_flight_.emplace(*operation->sequence, operation->instruction);
+      const auto [error, size] =
+          co_await boost::asio::async_write(socket_, boost::asio::buffer(operation->bytes),
+                                           boost::asio::as_tuple(boost::asio::use_awaitable));
+      if (error)
+        fail({ ResponseCode::CONNECTION_ERROR, "Failed to write to RMI TCP connection: " + error.message() });
+      operation->complete(failure_.value_or(ResponseStatus{}));
+      active_write_.reset();
+    }
   }
 
   void receive(std::string frame, std::vector<std::string>& unhandled)
@@ -504,47 +566,45 @@ private:
     unhandled.push_back(std::move(frame));
   }
 
-  void startRead()
+  boost::asio::awaitable<void> readLoop()
   {
-    socket_.async_read_some(boost::asio::buffer(read_buffer_), [this](const boost::system::error_code error,
-                                                                      const std::size_t size) {
+    std::array<char, 2048> buffer{};
+    rmi::detail::LineBuffer frames;
+    while (!failure_)
+    {
+      const auto [error, size] =
+          co_await socket_.async_read_some(boost::asio::buffer(buffer),
+                                          boost::asio::as_tuple(boost::asio::use_awaitable));
+      if (failure_)
+        co_return;
       if (error)
       {
         fail({ ResponseCode::CONNECTION_ERROR, error == boost::asio::error::eof ?
                                                    "RMI TCP connection was closed by the controller." :
                                                    "Failed to read from RMI TCP connection: " + error.message() });
-        return;
+        co_return;
       }
-      try
+      std::vector<std::string> unhandled;
+      for (auto& frame : frames.append(std::string_view(buffer.data(), size)))
+        receive(std::move(frame), unhandled);
       {
-        std::vector<std::string> unhandled;
-        for (auto& frame : line_buffer_.append(std::string_view(read_buffer_.data(), size)))
-          receive(std::move(frame), unhandled);
-        {
-          std::scoped_lock lock(mutex_);
-          incoming_.insert(incoming_.end(), std::make_move_iterator(unhandled.begin()),
-                           std::make_move_iterator(unhandled.end()));
-        }
-        changed_.notify_all();
-        pumpWrites();
+        std::scoped_lock lock(mutex_);
+        incoming_.insert(incoming_.end(), std::make_move_iterator(unhandled.begin()),
+                         std::make_move_iterator(unhandled.end()));
       }
-      catch (const std::exception& exception)
-      {
-        fail({ ResponseCode::SERVER_ERR, "Invalid RMI response: " + std::string(exception.what()) });
-        return;
-      }
-      startRead();
-    });
+      changed_.notify_all();
+      write_ready_.cancel_one();
+    }
   }
 
   boost::asio::io_context context_;
   boost::asio::ip::tcp::socket socket_{ context_ };
+  boost::asio::steady_timer write_ready_{ context_ };
   std::optional<boost::asio::executor_work_guard<boost::asio::io_context::executor_type>> work_;
   std::thread worker_;
   std::mutex mutex_;
   std::condition_variable changed_;
-  std::array<char, 2048> read_buffer_{};
-  bool writing_ = false;
+  std::shared_ptr<Write> active_write_;
   std::deque<std::shared_ptr<Write>> writes_;
   std::unordered_map<int, std::string> in_flight_;
   std::unordered_map<int, std::shared_ptr<std::promise<InstructionResult>>> pending_;
@@ -554,7 +614,6 @@ private:
   std::optional<ResponseStatus> read_failure_;
   std::optional<InstructionResponse> last_instruction_;
   int outstanding_ = 0;
-  rmi::detail::LineBuffer line_buffer_;
 };
 
 FanucRmiDriver::FanucRmiDriver(const std::string& robot_ip_address, const uint16_t rmi_port)

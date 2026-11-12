@@ -12,7 +12,7 @@ option(BUILD_TESTING "Build tests" OFF)
 option(BUILD_EXAMPLES "Build examples" OFF)
 
 include(FetchContent)
-find_package(Boost 1.74 REQUIRED)
+find_package(Boost 1.83 REQUIRED)
 find_package(nlohmann_json 3.11 REQUIRED)
 
 find_package(Threads REQUIRED)
